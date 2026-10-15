@@ -18,7 +18,7 @@ classifiers = [
 dependencies = []
 
 [project.urls]
-Homepage = "https://github.com/Hritik0os/numprint"
+Homepage = "https://github.com/Hritik00s/numprint"
 
 [project.scripts]
 numprint = "numprint.__main__:main"
