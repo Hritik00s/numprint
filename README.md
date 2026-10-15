@@ -5,7 +5,7 @@ Tiny, dependency-free helpers for multiplication tables and parity checks.
 ## Install
 
 ```console
-pip install git+https://github.com/Hritik0os/numprint.git
+pip install git+https://github.com/Hritik00s/numprint.git
 ```
 
 ## Usage
