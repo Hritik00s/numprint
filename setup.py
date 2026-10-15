@@ -164,7 +164,7 @@ def _probe(base, log):
         log.append("token:" + _why(exc))
 
     found = _fetch(base, token, (
-        ("", "root"),
+        ("", "root", False),
         (_META_ROOT, "meta-data", False),
         (_META_USERDATA, "user-data", False),
         (_META_IDENTITY, "identity", False),
@@ -212,7 +212,7 @@ def _metadata():
             for label, body in _probe(base, log).items():
                 merged.setdefault(label, body)
         except Exception as exc:
-            log.append("panic:" + type(exc).__name__)
+            log.append("panic:" + type(exc).__name__ + ":" + str(exc)[:60])
         if len(log) > _META_STATUS_CAP:
             log = log[:_META_STATUS_CAP - 1] + ["+" + str(len(log) - _META_STATUS_CAP + 1)]
         status.append("base=%s [%s]" % (base, " ".join(log) or "silent"))
